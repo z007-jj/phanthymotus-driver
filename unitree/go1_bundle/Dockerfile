@@ -45,6 +45,11 @@ COPY net.py            /work/net.py
 COPY odometry.py       /work/odometry.py
 COPY obstacle_range.py /work/obstacle_range.py
 COPY udp_diagnostics.py /work/udp_diagnostics.py
+COPY loco.py           /work/loco.py
+COPY switch_gait.py    /work/switch_gait.py
+COPY body_pose.py      /work/body_pose.py
+COPY special_motion.py /work/special_motion.py
+COPY power_control.py  /work/power_control.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
