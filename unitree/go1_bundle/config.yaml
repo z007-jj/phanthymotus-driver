@@ -17,5 +17,8 @@ plugins:
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
     enabled: true
 
+  joints:                       # 十二关节状态：q/dq/tau/temp（只读）
+    enabled: true
+
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
   #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。
