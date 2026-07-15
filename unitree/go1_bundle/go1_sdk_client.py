@@ -35,12 +35,18 @@ HIGH_LOCAL_PORT = 8090
 
 LOOP_HZ = 500.0        # 后台收发频率（高层 2ms 亦可）
 
-# ── 控制原语量程（高层 HighCmd 运动；spin 等控制卡用）───────────────────────────
-#   量程取 Go1 高层安全值；控制卡应先自校验拒绝越界，client 再 clamp 作兜底。
-VX_MAX = 1.0            # 前后 m/s
-VY_MAX = 0.6            # 平移 m/s
-VYAW_MAX = 2.0          # 偏航 rad/s
-MOVE_WATCHDOG_S = 0.5   # 看门狗：超过此时长无新 move → 自动回 idle(mode=0) 停下（控制卡停发即自停）
+# ── 控制原语量程（高层 HighCmd；spin/loco/body_pose 等控制卡用）───────────────────
+#   量程覆盖 comm.h/MT 各步态上限；控制卡先按【当前步态】自校验拒绝越界，client 再 clamp 兜底。
+VX_MAX = 3.5            # 前后 m/s（MT trot_run 上限；trot 内卡会更严）
+VY_MAX = 1.0            # 平移 m/s
+VYAW_MAX = 4.0          # 偏航 rad/s
+MOVE_WATCHDOG_S = 0.5   # 看门狗：超过此时长无新 move → 自动停下站稳（控制卡停发即自停）
+# 机身姿态/高度量程（body_pose 卡；取 comm.h/MT 上限，client clamp 兜底）
+EULER_RP_MAX = 0.75     # roll/pitch rad
+EULER_YAW_MAX = 0.6     # yaw rad
+BODY_HEIGHT_MIN, BODY_HEIGHT_MAX = -0.13, 0.03   # 机身高度偏移 m
+FOOT_RAISE_MIN, FOOT_RAISE_MAX = -0.06, 0.03     # 抬脚高度偏移 m
+POWER_OFF_CODE = 0xA5   # BmsCmd.off 关机命令字
 
 # HighState.mode（Go1 legacy comm.h）
 MODE_NAMES = {0: "idle", 1: "force_stand", 2: "walk", 5: "stand_down",
@@ -185,9 +191,13 @@ class Go1HighSdkClient:
         self._running = False
         self._thread = None
         self._snapshot: dict = {}
-        # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
-        self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
-        self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
+        # ── 控制目标（控制卡写，_loop 读并合成 HighCmd）；三者优先级 vel > hold > idle 心跳 ──
+        #   默认全空 → _compose_cmd 发 idle(mode=0)，loco_state/battery 等状态卡不受影响。
+        self._vel = None            # (vx, vy, vyaw, gait) 速度目标（带看门狗），或 None
+        self._vel_deadline = 0.0    # monotonic 截止；过期即停下站稳
+        self._gait = 0              # 期望步态（switch_gait 设；move 缺省用它），默认 idle（须先切 trot 才能 move）
+        self._hold = None           # 持久姿态/模式 dict 或 None；如 {"mode":1,"euler":[r,p,y],"bodyHeight":h,"footRaiseHeight":f}
+        self._power_off = False     # 一次置位后持续下发 BmsCmd.off（终态，不复位）
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
         self._diag_lock = threading.Lock()
         self._diag = {
@@ -312,8 +322,8 @@ class Go1HighSdkClient:
         except Exception as e:
             print(f"[Go1HighSdk] parse_state error: {e}", flush=True)
 
-    # ── 控制原语（CONTRIBUTING §4：让只读 client 具备下发能力，供 spin 等控制卡用）──
-    #   默认不动：无 move 目标时 _compose_cmd 发 idle(mode=0)，loco_state/battery 等状态卡不受影响。
+    # ── 控制原语（CONTRIBUTING §4：让 client 具备下发能力，供 spin/loco/body_pose/… 控制卡用）──
+    #   默认不动：无任何目标时 _compose_cmd 发 idle(mode=0)，状态卡不受影响。
     @staticmethod
     def _clamp(v, lim):
         try:
@@ -321,44 +331,122 @@ class Go1HighSdkClient:
         except Exception:
             return 0.0
 
-    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=1):
+    @staticmethod
+    def _clamp_range(v, lo, hi):
+        try:
+            return max(lo, min(hi, float(v)))
+        except Exception:
+            return 0.0
+
+    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=None):
         """设置一次高层速度目标（mode=2）并刷新看门狗；后台 _loop 下发。
-        控制卡按节奏（如每 50ms）重发以持续运动，停发 0.5s 后自动回 idle 停下。"""
+        gait=None 用当前期望步态（switch_gait 设的 self._gait）。控制卡按节奏重发以持续运动，
+        停发 0.5s 后自动停下站稳。速度会覆盖持久姿态（_hold）。"""
         vx = self._clamp(vx, VX_MAX)
         vy = self._clamp(vy, VY_MAX)
         vyaw = self._clamp(vyaw, VYAW_MAX)
         with self._lock:
-            self._move_cmd = (vx, vy, vyaw, int(gait))
-            self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
-        return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": int(gait)}
+            g = self._gait if gait is None else int(gait)
+            self._vel = (vx, vy, vyaw, g)
+            self._vel_deadline = time.monotonic() + MOVE_WATCHDOG_S
+            self._hold = None
+        return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": g}
 
     def stop_move(self):
-        """清除速度目标 → 下一循环回 idle(mode=0) 停下站稳。"""
+        """清除所有目标 → 下一循环回 idle(mode=0) 停下站稳。"""
         with self._lock:
-            self._move_cmd = None
-            self._move_deadline = 0.0
+            self._vel = None
+            self._vel_deadline = 0.0
+            self._hold = None
+
+    def set_mode(self, mode):
+        """持久设一个简单 HighCmd 模式（1 力控站立 /5 趴下 /6 起立 /7 阻尼 /8 恢复 /10,11 特殊）。
+        清除速度目标；无看门狗（保持该模式直到下一条命令）。"""
+        with self._lock:
+            self._vel = None
+            self._vel_deadline = 0.0
+            self._hold = {"mode": int(mode)}
+        return {"mode": int(mode)}
+
+    def set_gait(self, gait):
+        """设期望步态（仅记住；实际行走由 move 触发，mode=2 时才生效）。"""
+        with self._lock:
+            self._gait = int(gait)
+        return {"gaitType": int(gait)}
+
+    def get_gait(self):
+        with self._lock:
+            return self._gait
+
+    def set_pose(self, roll=0.0, pitch=0.0, yaw=0.0, body_height=0.0, foot_raise=0.0):
+        """持久设机身姿态/高度（mode=1 力控站立 + euler/bodyHeight/footRaiseHeight）。清除速度目标。"""
+        roll = self._clamp(roll, EULER_RP_MAX)
+        pitch = self._clamp(pitch, EULER_RP_MAX)
+        yaw = self._clamp(yaw, EULER_YAW_MAX)
+        bh = self._clamp_range(body_height, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX)
+        fr = self._clamp_range(foot_raise, FOOT_RAISE_MIN, FOOT_RAISE_MAX)
+        with self._lock:
+            self._vel = None
+            self._vel_deadline = 0.0
+            self._hold = {"mode": 1, "euler": [roll, pitch, yaw],
+                          "bodyHeight": bh, "footRaiseHeight": fr}
+        return {"roll": roll, "pitch": pitch, "yaw": yaw,
+                "body_height": bh, "foot_raise": fr}
+
+    def request_power_off(self):
+        """置位关机：_compose_cmd 之后持续写 BmsCmd.off=0xA5（终态、不可逆、不复位）。"""
+        with self._lock:
+            self._power_off = True
 
     def _compose_cmd(self) -> None:
-        """按当前 move 目标 + 看门狗合成 _cmd：默认 idle(mode=0)；目标有效则速度(mode=2)。"""
+        """按 vel > hold > idle 优先级合成 _cmd；vel 过期即停下站稳。"""
         if self._cmd is None:
             return
         now = time.monotonic()
         with self._lock:
-            mc = self._move_cmd if (self._move_cmd is not None and now < self._move_deadline) else None
+            vel = self._vel if (self._vel is not None and now < self._vel_deadline) else None
+            hold = None if vel is not None else self._hold
+            power_off = self._power_off
         try:
-            if mc is None:
-                self._cmd.mode = 0
-                self._cmd.gaitType = 0
-                self._cmd.velocity = [0.0, 0.0]
-                self._cmd.yawSpeed = 0.0
-            else:
-                vx, vy, vyaw, gait = mc
-                self._cmd.mode = 2
-                self._cmd.gaitType = int(gait)
-                self._cmd.velocity = [float(vx), float(vy)]
-                self._cmd.yawSpeed = float(vyaw)
+            c = self._cmd
+            # 每周期先归零，避免上一条命令的字段残留
+            c.mode = 0
+            c.gaitType = 0
+            c.velocity = [0.0, 0.0]
+            c.yawSpeed = 0.0
+            c.euler = [0.0, 0.0, 0.0]
+            c.bodyHeight = 0.0
+            c.footRaiseHeight = 0.0
+            if power_off:
+                self._set_bms_off(c)
+                return
+            if vel is not None:
+                vx, vy, vyaw, gait = vel
+                c.mode = 2
+                c.gaitType = int(gait)
+                c.velocity = [float(vx), float(vy)]
+                c.yawSpeed = float(vyaw)
+            elif hold is not None:
+                c.mode = int(hold.get("mode", 1))
+                eul = hold.get("euler")
+                if eul is not None:
+                    c.euler = [float(eul[0]), float(eul[1]), float(eul[2])]
+                c.bodyHeight = float(hold.get("bodyHeight", 0.0))
+                c.footRaiseHeight = float(hold.get("footRaiseHeight", 0.0))
+            # 否则保持 idle(mode=0) 心跳
         except Exception as e:  # noqa: BLE001
             print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
+
+    @staticmethod
+    def _set_bms_off(c) -> None:
+        """尽力写 HighCmd.bms.off=0xA5（不同绑定字段名可能不同 → 防御式）。"""
+        try:
+            bms = getattr(c, "bms", None)
+            if bms is not None and hasattr(bms, "off"):
+                bms.off = POWER_OFF_CODE
+                c.bms = bms
+        except Exception:  # noqa: BLE001
+            pass
 
     def snapshot(self) -> dict:
         with self._lock:
