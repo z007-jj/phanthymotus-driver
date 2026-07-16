@@ -42,6 +42,13 @@ VY_MAX = 0.6            # 平移 m/s
 VYAW_MAX = 2.0          # 偏航 rad/s
 MOVE_WATCHDOG_S = 0.5   # 看门狗：超过此时长无新 move → 自动回 idle(mode=0) 停下（控制卡停发即自停）
 
+# ── 速度档位（test_speed_gear 卡；纯偏好设置，不下发任何 HighCmd）────────────────
+#   把"走快点/慢点"映射到 slow/normal/fast；闭环便捷动作(未来 move_distance/turn_angle、spin)
+#   缺省速度按当前档取。不影响显式 loco.move（它自带速度）。值 clamp 在上面量程内。
+SPEED_GEARS = {"slow": 0.15, "normal": 0.35, "fast": 0.60}   # 缺省前进/平移速度 m/s
+SPEED_GEAR_YAW = {"slow": 0.40, "normal": 0.80, "fast": 1.50}  # 缺省偏航 rad/s
+DEFAULT_SPEED_GEAR = "normal"
+
 # HighState.mode（Go1 legacy comm.h）
 MODE_NAMES = {0: "idle", 1: "force_stand", 2: "walk", 5: "stand_down",
               6: "stand_up", 7: "damp", 8: "recovery", 10: "jump_yaw", 11: "straight_hand"}
@@ -196,6 +203,7 @@ class Go1HighSdkClient:
             "send_error": 0, "flag_error": 0,
             "recv_crc_error": 0, "recv_lose_error": 0, "accessible": False,
         }
+        self._speed_gear = DEFAULT_SPEED_GEAR   # 【test_speed_gear 卡】纯偏好档位,不下发命令
         self._init_sdk()
 
     def _init_sdk(self) -> None:
@@ -387,6 +395,30 @@ class Go1HighSdkClient:
                 self._cmd.yawSpeed = 0.0
         except Exception as e:  # noqa: BLE001
             print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
+
+    # ── 速度档位（test_speed_gear 卡；纯偏好,不下发任何命令）──────────────────────
+    def set_speed_gear(self, gear):
+        """设速度档位 slow/normal/fast（非法值回落 normal）。返回归一化后的档位名。"""
+        g = str(gear).lower()
+        if g not in SPEED_GEARS:
+            g = DEFAULT_SPEED_GEAR
+        with self._lock:
+            self._speed_gear = g
+        return g
+
+    def speed_gear(self):
+        with self._lock:
+            return self._speed_gear
+
+    def gear_speed(self):
+        """当前档位对应的缺省前进/平移速度 m/s（闭环便捷动作缺省用；clamp 在量程内）。"""
+        v = SPEED_GEARS.get(self.speed_gear(), SPEED_GEARS[DEFAULT_SPEED_GEAR])
+        return min(v, VX_MAX)
+
+    def gear_yaw_rate(self):
+        """当前档位对应的缺省偏航速度 rad/s（转圈类缺省用；clamp 在量程内）。"""
+        v = SPEED_GEAR_YAW.get(self.speed_gear(), SPEED_GEAR_YAW[DEFAULT_SPEED_GEAR])
+        return min(v, VYAW_MAX)
 
     def snapshot(self) -> dict:
         with self._lock:
