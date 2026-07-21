@@ -14,7 +14,8 @@
  *   新版:
  *     · startCapture 后 getCalibParams() 从相机闪存读标定(K,D,xi) → 无需外部 YAML
  *     · build_undistort_maps() 按 CMei 投影方程手算映射表(搬自 camera_adapter.cpp,已验证逐像素0误差)
- *     · getRawFrame 取原始双目帧 → 裁左目 → cv::remap 去鱼眼 → cv::flip 翻正 → 自动裁黑边 → JPEG
+ *     · getRawFrame 取原始双目帧 → 裁左目 → cv::remap 去鱼眼 → cv::flip 翻正 → 自动裁黑边
+ *       → GStreamer nvjpegenc（Jetson NVJPG 硬件）压成 JPEG
  *     · 无 startStereoCompute → 零暖机、帧率从~14-30fps 提升到 30-60fps
  *     · focal_scale 控制输出 FOV,auto_crop 自动裁掉黑角 → 输出完整填充的无畸变平面图
  *   标定读取失败时 fallback 到旧版 getRectStereoFrame(向后兼容)。
@@ -32,12 +33,15 @@
  * 编译(nano_bootstrap 自动做):
  *   g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 \
  *     -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \
- *     $(pkg-config --cflags --libs opencv4) -o bins/rgb_stream
+ *     $(pkg-config --cflags --libs opencv4 gstreamer-1.0 gstreamer-app-1.0) -o bins/rgb_stream
  * 用法:rgb_stream <port> <device_id>
  *   例:./bins/rgb_stream 9203 0     # left(.14 dev0),端口 9203
  */
 #include <UnitreeCameraSDK.hpp>
 #include <opencv2/opencv.hpp>
+#include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -60,6 +64,108 @@ static bool send_all(int fd, const uint8_t *p, size_t n) {
     }
     return true;
 }
+
+// Jetson 的 nvjpegenc 使用 NVJPG 专用硬件编码 JPEG。输入是普通 BGR 内存，插件负责送入
+// 硬件；因此保留 cv::Mat 去鱼眼管线，但不再用 OpenCV/libjpeg 占 CPU 压缩图片。
+// 一台 Nano 只有一个相机服务会在单次连接中编码，appsink 单缓冲并丢旧帧，防止网络慢时堆帧。
+class NvJpegEncoder {
+public:
+    NvJpegEncoder() = default;
+    ~NvJpegEncoder() { close(); }
+
+    bool encode(const cv::Mat &bgr, std::vector<uchar> &jpeg) {
+        if (bgr.empty() || bgr.type() != CV_8UC3) return false;
+        if (!pipeline_ && !open(bgr.cols, bgr.rows)) return false;
+        if (bgr.cols != width_ || bgr.rows != height_) return false;
+
+        const size_t bytes = bgr.total() * bgr.elemSize();
+        GstBuffer *in = gst_buffer_new_allocate(nullptr, bytes, nullptr);
+        if (!in) return false;
+        GstMapInfo in_map;
+        if (!gst_buffer_map(in, &in_map, GST_MAP_WRITE)) {
+            gst_buffer_unref(in);
+            return false;
+        }
+        // appsrc 必须在 gst_buffer 生命周期内拥有稳定内存；此处只做一次帧交接拷贝，JPEG
+        // 压缩实际由 nvjpegenc 的 NVJPG 硬件完成。
+        if (bgr.isContinuous()) {
+            memcpy(in_map.data, bgr.data, bytes);
+        } else {
+            const size_t row_bytes = (size_t)bgr.cols * bgr.elemSize();
+            for (int y = 0; y < bgr.rows; ++y)
+                memcpy(in_map.data + (size_t)y * row_bytes, bgr.ptr(y), row_bytes);
+        }
+        gst_buffer_unmap(in, &in_map);
+
+        GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), in);
+        if (flow != GST_FLOW_OK) return false;  // push 后 buffer 所有权已移交 appsrc
+
+        GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appsink_), GST_SECOND);
+        if (!sample) return false;
+        GstBuffer *out = gst_sample_get_buffer(sample);
+        GstMapInfo out_map;
+        bool ok = out && gst_buffer_map(out, &out_map, GST_MAP_READ);
+        if (ok) {
+            jpeg.assign(out_map.data, out_map.data + out_map.size);
+            gst_buffer_unmap(out, &out_map);
+        }
+        gst_sample_unref(sample);
+        return ok && !jpeg.empty();
+    }
+
+private:
+    bool open(int width, int height) {
+        GError *err = nullptr;
+        pipeline_ = gst_parse_launch(
+            "appsrc name=src is-live=true format=time block=true "
+            "! video/x-raw,format=BGR "
+            "! nvjpegenc quality=70 "
+            "! appsink name=sink sync=false max-buffers=1 drop=true",
+            &err);
+        if (!pipeline_) {
+            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 创建失败: %s\\n",
+                    err ? err->message : "unknown error");
+            if (err) g_error_free(err);
+            return false;
+        }
+        appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "src");
+        appsink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
+        if (!appsrc_ || !appsink_) {
+            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 缺少 appsrc/appsink\\n");
+            close();
+            return false;
+        }
+        GstCaps *caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGR",
+                                             "width", G_TYPE_INT, width,
+                                             "height", G_TYPE_INT, height,
+                                             "framerate", GST_TYPE_FRACTION, 30, 1, nullptr);
+        g_object_set(appsrc_, "caps", caps, "stream-type", GST_APP_STREAM_TYPE_STREAM,
+                     "format", GST_FORMAT_TIME, nullptr);
+        gst_caps_unref(caps);
+        if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 无法启动\\n");
+            close();
+            return false;
+        }
+        width_ = width;
+        height_ = height;
+        fprintf(stderr, "[rgb_stream] JPEG 使用 Jetson NVJPG 硬件编码(nvjpegenc, quality=70)\\n");
+        return true;
+    }
+
+    void close() {
+        if (pipeline_) gst_element_set_state(pipeline_, GST_STATE_NULL);
+        if (appsrc_) gst_object_unref(appsrc_);
+        if (appsink_) gst_object_unref(appsink_);
+        if (pipeline_) gst_object_unref(pipeline_);
+        pipeline_ = appsrc_ = appsink_ = nullptr;
+    }
+
+    GstElement *pipeline_ = nullptr;
+    GstElement *appsrc_ = nullptr;
+    GstElement *appsink_ = nullptr;
+    int width_ = 0, height_ = 0;
+};
 
 // 按 device_id 生成一份最小 stereo config(标定从相机 flash 加载);返回文件路径,失败返回空。
 // 镜像 depth_stream / pointcloud_stream 的 write_config:只填 DeviceNode+尺寸,标定靠 flash。
@@ -281,7 +387,7 @@ static void serve_client(int cli, int device_id) {
         fprintf(stderr, "[rgb_stream] dev%d fallback 到 stereo rectify 管线(getRectStereoFrame, ~5-6s 暖机)\n", device_id);
     }
 
-    std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 70};
+    NvJpegEncoder jpeg_encoder;
     while (cam.isOpened()) {
         cv::Mat out;
 
@@ -317,7 +423,12 @@ static void serve_client(int cli, int device_id) {
         if (out.type() != CV_8UC3) cv::cvtColor(out, out, cv::COLOR_GRAY2BGR);
 
         std::vector<uchar> buf;
-        if (!cv::imencode(".jpg", out, buf, jpgparams) || buf.empty()) continue;
+        if (!jpeg_encoder.encode(out, buf)) {
+            // 本部署的所有 Nano 都具备 nvjpegenc；不能静默退回 cv::imencode，避免 JPEG
+            // 压缩重新吃满 CPU。断开后由 systemd 重启，下一次客户端连接会重新建硬件管线。
+            fprintf(stderr, "[rgb_stream] NVJPG 硬件 JPEG 编码失败，关闭本次连接（不回退 CPU）\\n");
+            break;
+        }
         uint32_t n = htonl((uint32_t)buf.size());
         if (!send_all(cli, reinterpret_cast<uint8_t *>(&n), 4)) break;
         if (!send_all(cli, buf.data(), buf.size())) break;
@@ -329,6 +440,7 @@ static void serve_client(int cli, int device_id) {
 }
 
 int main(int argc, char *argv[]) {
+    gst_init(&argc, &argv);
     if (argc < 3) {
         fprintf(stderr, "用法: %s <port> <device_id>\n", argv[0]);
         _exit(1);
