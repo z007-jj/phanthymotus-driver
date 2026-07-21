@@ -281,7 +281,7 @@ static void serve_client(int cli, int device_id) {
         fprintf(stderr, "[rgb_stream] dev%d fallback 到 stereo rectify 管线(getRectStereoFrame, ~5-6s 暖机)\n", device_id);
     }
 
-    std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 80};
+    std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 70};
     while (cam.isOpened()) {
         cv::Mat out;
 

@@ -107,6 +107,8 @@ class _RgbStream:
         self.connected = False
         self.frames = 0
         self.position = None
+        self._last_publish_ms = 0        # 上次 publish 时间戳（用于帧跳过）
+        self._MIN_INTERVAL_MS = 30       # 最小帧间隔 ~30fps 上限，低于此值丢弃旧帧
 
     def start(self, position: str, host: str, port: int):
         self._run = True
@@ -150,6 +152,13 @@ class _RgbStream:
                         got_first = True
                         s.settimeout(_STEADY_TIMEOUT)   # 第一帧已到 → 收紧读超时以便快速发现流断
                         self._node.get_logger().info(f"[{position}] 首帧到达,进入稳态推流")
+
+                    # 帧跳过：如果距离上次 publish 间隔太短，丢弃当前旧帧避免队列积压
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        self.frames += 1
+                        continue
+
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
@@ -158,6 +167,7 @@ class _RgbStream:
                         msg.data = data
                         try:
                             self._pub.publish(msg)
+                            self._last_publish_ms = now_ms
                         except Exception:
                             break
                     self.frames += 1
@@ -204,6 +214,21 @@ class CameraRgbPlugin:
                 print(f"[{CARD}] ROS2 不可用: {e}", flush=True)
                 self._node = None
         print(f"[{CARD}] 机位就绪：{sorted(self._positions.keys())}（default={self._default_pos}）", flush=True)
+        # 异步预热 default_position：建立 TCP 连接 + 等首帧，保持连接不释放
+        threading.Thread(target=self._warmup, daemon=True).start()
+
+    def _warmup(self):
+        """预热 default_position：建立 TCP 连接 + 等首帧，之后保持连接不释放。"""
+        time.sleep(3)  # 等 ROS2 节点稳定
+        pos = self._default_pos
+        p = self._positions.get(pos, {})
+        print(f"[{CARD}] 预热 {pos} @ {p['board_ip']}:{p['image_port']}", flush=True)
+        st = self._stream_for("warmup")
+        result = self._start_instance("warmup", pos)
+        if result.get("ok"):
+            print(f"[{CARD}] 预热完成，{pos} 已就绪", flush=True)
+        # 不调 st.stop() → 连接保持，相机保持打开
+        # 当用户真正 start 某个 instance_id 时，该 instance 有独立 _RgbStream，不受影响
 
     def _topic(self, iid: str) -> str:
         # 实例 topic 用 instance_id 区分；instance_id 默认就是 position 名 → topic 即 /{ns}/vision/{pos}/mono
