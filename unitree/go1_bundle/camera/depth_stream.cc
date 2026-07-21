@@ -108,6 +108,7 @@ static void serve_client(int cli, int device_id) {
             usleep(2000);
             continue;
         }
+        cv::flip(depth, depth, 0);   // 上下翻转(待验证:若仍左右反则改 -1)
         std::vector<uchar> buf;
         cv::imencode(".jpg", depth, buf, jpgparams);
         uint32_t n = htonl((uint32_t)buf.size());
