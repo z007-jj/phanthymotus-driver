@@ -214,21 +214,6 @@ class CameraRgbPlugin:
                 print(f"[{CARD}] ROS2 不可用: {e}", flush=True)
                 self._node = None
         print(f"[{CARD}] 机位就绪：{sorted(self._positions.keys())}（default={self._default_pos}）", flush=True)
-        # 异步预热 default_position：建立 TCP 连接 + 等首帧，保持连接不释放
-        threading.Thread(target=self._warmup, daemon=True).start()
-
-    def _warmup(self):
-        """预热 default_position：建立 TCP 连接 + 等首帧，之后保持连接不释放。"""
-        time.sleep(3)  # 等 ROS2 节点稳定
-        pos = self._default_pos
-        p = self._positions.get(pos, {})
-        print(f"[{CARD}] 预热 {pos} @ {p['board_ip']}:{p['image_port']}", flush=True)
-        st = self._stream_for("warmup")
-        result = self._start_instance("warmup", pos)
-        if result.get("ok"):
-            print(f"[{CARD}] 预热完成，{pos} 已就绪", flush=True)
-        # 不调 st.stop() → 连接保持，相机保持打开
-        # 当用户真正 start 某个 instance_id 时，该 instance 有独立 _RgbStream，不受影响
 
     def _topic(self, iid: str) -> str:
         # 实例 topic 用 instance_id 区分；instance_id 默认就是 position 名 → topic 即 /{ns}/vision/{pos}/mono
