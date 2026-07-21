@@ -12,9 +12,9 @@
  *   卡 stop / 断开 → 相机立即释放。**无需常占、免重启热切。**
  * ★ 抢占:开相机前 fuser -k /dev/video<device_id> 释放占用者(出厂 point_cloud_node / pointcloud_stream 等)。
  *
- * 协议:每帧 = [4字节大端长度 N][N 字节 JPEG 数据](与 test_camera_depth.py 桥接约定一致)
- *   ★ 用 JPEG(不是 PNG):画布只渲染 image/jpeg 的 CompressedImage(对齐 camera_rgb);
- *     彩色深度图是 3 通道 BGR 可视化(给人看,非原始深度值),JPEG 有损无妨。
+ * 协议:每帧 = [4字节大端宽度][4字节大端高度][N 字节 16UC1 原始深度数据]
+ *   ★ 推送原始深度数据(16UC1, 毫米):对齐 G1 RealSense 实现的可测距深度流;
+ *     每像素为毫米距离值,可直接用于测距和避障算法。
  *
  * 编译(nano_bootstrap 自动做):
  *   g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 \
@@ -100,20 +100,25 @@ static void serve_client(int cli, int device_id) {
     cam.startStereoCompute();
     fprintf(stderr, "[depth_stream] dev%d 相机已开,开始推流\n", device_id);
 
-    std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 85};
     while (cam.isOpened()) {
         cv::Mat depth;
         std::chrono::microseconds t;
-        if (!cam.getDepthFrame(depth, true, t) || depth.empty()) {
+        // 获取原始深度数据(第二个参数 false),不进行彩色化
+        if (!cam.getDepthFrame(depth, false, t) || depth.empty()) {
             usleep(2000);
             continue;
         }
         cv::flip(depth, depth, 0);   // 上下翻转(待验证:若仍左右反则改 -1)
-        std::vector<uchar> buf;
-        cv::imencode(".jpg", depth, buf, jpgparams);
-        uint32_t n = htonl((uint32_t)buf.size());
-        if (!send_all(cli, reinterpret_cast<uint8_t *>(&n), 4)) break;   // 对端断开
-        if (!send_all(cli, buf.data(), buf.size())) break;
+
+        // 发送协议头: [4B宽度][4B高度]
+        uint32_t width = htonl((uint32_t)depth.cols);
+        uint32_t height = htonl((uint32_t)depth.rows);
+        size_t data_size = depth.total() * depth.elemSize();  // 640*400*2 = 512000 字节 (16UC1)
+
+        if (!send_all(cli, reinterpret_cast<uint8_t *>(&width), 4)) break;
+        if (!send_all(cli, reinterpret_cast<uint8_t *>(&height), 4)) break;
+        if (!send_all(cli, depth.data, data_size)) break;
+
         usleep(50000);   // ~20Hz 上限(实际受深度计算限速)
     }
     // 客户端断开:UnitreeCamera 析构有 SDK double-free bug(core dump)。用 _exit(0) 干净退出,
