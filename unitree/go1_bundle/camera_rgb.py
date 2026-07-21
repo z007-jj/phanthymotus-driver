@@ -236,7 +236,8 @@ class CameraRgbPlugin:
         print(f"[{CARD}] 机位就绪：{sorted(self._positions.keys())}（default={self._default_pos}）", flush=True)
 
     def _topic(self, iid: str) -> str:
-        # 实例 topic 用 instance_id 区分；instance_id 默认就是 position 名 → topic 即 /{ns}/vision/{pos}/mono
+        # 画布卡的 instance_id 是稳定的订阅标识；切换机位时只换上游，
+        # 仍向同一个实例 topic 发布，确保“查看数据流”会看到切换后的画面。
         safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
         return f"/{self._ns}/vision/{safe}/mono"
 
@@ -304,8 +305,9 @@ class CameraRgbPlugin:
                                           "description": "start=连接并推流 / stop=断开并释放相机 / info=查询状态"}},
                 "required": ["action"],
             },
-            "topic_out": ([{"topic": f"/{self._ns}/vision/{self._default_pos}/mono",
-                           "format": FMT}] if self._node else []),
+            # multiInstance 的 topic 必须由 info(instance_id) 决定。不能在这里
+            # 声明 default/front，否则画布会把所有实例错误地订阅到 front。
+            "topic_out": [],
         }]
 
     def dispatch(self, action, args) -> dict | None:
