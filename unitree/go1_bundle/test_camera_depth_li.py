@@ -28,6 +28,7 @@ main.py 会按 config 自动 import 本模块并调用 make_plugin()，无需改
 from __future__ import annotations
 
 import socket
+import select
 import struct
 import threading
 import time
@@ -82,16 +83,6 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _recvall(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
 # ── 单实例深度桥：连某机位 board_ip:depth_port 收 [4B 长度][JPEG] → 发布 CompressedImage ──
 
 class _DepthStream:
@@ -109,6 +100,10 @@ class _DepthStream:
         self.connected = False
         self.frames = 0
         self.position = None
+        self._last_publish_ms = 0
+        self._MIN_INTERVAL_MS = 30       # 最多发布约 30fps
+        # 单次最多从内核接收队列取 1 MiB；循环会立即继续 drain，避免在持续来帧时长期霸占线程。
+        self._MAX_DRAIN_BYTES = 1_048_576
 
     def start(self, position: str, host: str, port: int):
         self._run = True
@@ -127,9 +122,10 @@ class _DepthStream:
         while self._run and gen == self._gen:
             try:
                 s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
-                # create_connection 会把 timeout 留在 socket 上当读超时；首帧需等 SDK 初始化，
-                # 故显式放宽到 _FIRST_FRAME_TIMEOUT，出帧后再收紧到 _STEADY_TIMEOUT。
-                s.settimeout(_FIRST_FRAME_TIMEOUT)
+                # 使用非阻塞批量读取：每轮解析所有已完整帧，只发布最新一帧。
+                # TCP 是有序字节流；若逐帧 recv 再按时间丢弃，旧 JPEG 会堆在内核接收队列，
+                # 画面就会越看越滞后（旧 test_camera_depth_li 的延时根因）。保留未完整的数据，下一轮继续拼帧。
+                s.setblocking(False)
                 self.connected = True
                 self._node.get_logger().info(
                     f"[{position}] 已连上 depth_stream {host}:{port}（等首帧，SDK 初始化~3-4s）")
@@ -139,31 +135,65 @@ class _DepthStream:
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    n = struct.unpack(">I", hdr)[0]
-                    if n <= 0 or n > 5_000_000:
-                        break
-                    data = _recvall(s, n)
-                    if data is None:
-                        break
+
+                    # 丢弃本批次中已过期的完整帧，仅留下最后一帧待发布；不完整尾帧保留到下一次 recv。
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 4:
+                        n = struct.unpack(">I", rx[:4])[0]
+                        if n <= 0 or n > 5_000_000:
+                            raise ValueError(f"invalid JPEG frame length: {n}")
+                        end = 4 + n
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
                     if not got_first:
                         got_first = True
-                        s.settimeout(_STEADY_TIMEOUT)   # 首帧已到 → 收紧读超时以便快速发现流断
                         self._node.get_logger().info(f"[{position}] 首帧到达，进入稳态推流")
+
+                    # 发布节流只影响 ROS2 输出；接收端仍持续 drain TCP 队列，避免旧帧重新积压。
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        continue
+
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
                         msg.format = "jpeg"
-                        msg.data = data
+                        msg.data = latest
                         try:
                             self._pub.publish(msg)
+                            self._last_publish_ms = now_ms
                         except Exception:
                             break
-                    self.frames += 1
             except Exception as e:  # noqa: BLE001
                 self._node.get_logger().warn(f"[{position}] depth stream 中断: {e}")
             finally:
