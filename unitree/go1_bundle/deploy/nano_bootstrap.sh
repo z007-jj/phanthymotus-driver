@@ -51,7 +51,7 @@ CAM_ROWS=(
   "right 192.168.123.14 1 9204"
   "belly 192.168.123.15 0 9205"
 )
-if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
+if [ -f "$DEPLOY/camera/rgb_stream.cc" ] && [ -f "$DEPLOY/camera/nvjpeg_worker.cc" ]; then
   CAM_DONE=""   # 已处理过的板（每板只编译/禁 autostart/腾设备一次）
   for row in "${CAM_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
@@ -68,20 +68,21 @@ if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
         # ③ 停掉旧 camera_adapter 路线的服务（若之前装过 go1-camera-adapter-*，避免抢 9201~9205 没用、
         #   但抢相机/端口）。新路线服务名是 go1-rgb-<pos>，与旧名不冲突，这里只清旧的。
         bssh "$B" "echo $PW | sudo -S systemctl stop go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; echo $PW | sudo -S systemctl disable go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; true" 2>/dev/null
-        log "camera: 在 $B 编 rgb_stream(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/rgb_stream" 2>/dev/null
+        log "camera: 在 $B 编 rgb_stream + 隔离 nvjpeg_worker(SDK=$SDK)…"
+        bssh "$B" "rm -f $SDK/bins/rgb_stream $SDK/bins/nvjpeg_worker" 2>/dev/null
         bscp "$B" "$DEPLOY/camera/rgb_stream.cc" "$SDK/rgb_stream.cc" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera/nvjpeg_worker.cc" "$SDK/nvjpeg_worker.cc" 2>/dev/null
         # OpenCV 编法镜像 depth_stream：opencv4 用 pkg-config；.14 无 pkg-config → 显式 /usr/local + rpath。
-        # JPEG 则强制链接 JetPack 自带 GStreamer nvjpegenc（NVJPG 硬件），不再编进 CPU imencode 路径。
+        # rgb_stream 不链接 GStreamer，避免与 Unitree SDK 的 libjpeg ABI 冲突；独立 worker 才链接 nvjpegenc。
         # 🔴 /usr/local 回退必须链全 opencv 模块:SDK 的 libunitree_camera.a(StereoCameraCommon) 内部用
         #   cv::VideoWriter(videoio)、cv::StereoSGBM/StereoBM(calib3d),只链 core/imgproc/imgcodecs 会
         #   undefined reference → .14 编不过(left/right inactive)。pkg-config opencv4 自带全模块不受影响。
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; GST=\$(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null); if [ -z \"\$GST\" ]; then echo missing-gstreamer-dev; exit 1; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV \$GST -o bins/rgb_stream 2>&1 | tail -6" 2>&1 | tail -6
+        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; GST=\$(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null); if [ -z \"\$GST\" ]; then echo missing-gstreamer-dev; exit 1; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/rgb_stream && g++ -O2 -std=c++14 -pthread nvjpeg_worker.cc \$GST -o bins/nvjpeg_worker 2>&1 | tail -8" 2>&1 | tail -8
         CAM_DONE="$CAM_DONE $B"
         ;;
     esac
-    if ! bssh "$B" "[ -x $SDK/bins/rgb_stream ]" 2>/dev/null; then
-      log "camera: $POS@$B 无有效二进制(编译失败?可能缺 opencv)→ 跳过服务"; continue
+    if ! bssh "$B" "[ -x $SDK/bins/rgb_stream ] && [ -x $SDK/bins/nvjpeg_worker ]" 2>/dev/null; then
+      log "camera: $POS@$B 无有效 rgb_stream/nvjpeg_worker(编译失败?可能缺依赖)→ 跳过服务"; continue
     fi
     SVC="go1-rgb-$POS"
     bssh "$B" "cat > /tmp/$SVC.service <<EOF

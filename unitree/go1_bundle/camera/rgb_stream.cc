@@ -15,7 +15,7 @@
  *     · startCapture 后 getCalibParams() 从相机闪存读标定(K,D,xi) → 无需外部 YAML
  *     · build_undistort_maps() 按 CMei 投影方程手算映射表(搬自 camera_adapter.cpp,已验证逐像素0误差)
  *     · getRawFrame 取原始双目帧 → 裁左目 → cv::remap 去鱼眼 → cv::flip 翻正 → 自动裁黑边
- *       → GStreamer nvjpegenc（Jetson NVJPG 硬件）压成 JPEG
+ *       → 独立 nvjpeg_worker 进程的 GStreamer nvjpegenc（Jetson NVJPG 硬件）压成 JPEG
  *     · 无 startStereoCompute → 零暖机、帧率从~14-30fps 提升到 30-60fps
  *     · focal_scale 控制输出 FOV,auto_crop 自动裁掉黑角 → 输出完整填充的无畸变平面图
  *   标定读取失败时 fallback 到旧版 getRectStereoFrame(向后兼容)。
@@ -33,15 +33,12 @@
  * 编译(nano_bootstrap 自动做):
  *   g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 \
  *     -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \
- *     $(pkg-config --cflags --libs opencv4 gstreamer-1.0 gstreamer-app-1.0) -o bins/rgb_stream
+ *     $(pkg-config --cflags --libs opencv4) -o bins/rgb_stream
  * 用法:rgb_stream <port> <device_id>
  *   例:./bins/rgb_stream 9203 0     # left(.14 dev0),端口 9203
  */
 #include <UnitreeCameraSDK.hpp>
 #include <opencv2/opencv.hpp>
-#include <gst/gst.h>
-#include <gst/app/gstappsrc.h>
-#include <gst/app/gstappsink.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -51,6 +48,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <sys/wait.h>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -65,9 +63,28 @@ static bool send_all(int fd, const uint8_t *p, size_t n) {
     return true;
 }
 
-// Jetson 的 nvjpegenc 使用 NVJPG 专用硬件编码 JPEG。输入是普通 BGR 内存，插件负责送入
-// 硬件；因此保留 cv::Mat 去鱼眼管线，但不再用 OpenCV/libjpeg 占 CPU 压缩图片。
-// 一台 Nano 只有一个相机服务会在单次连接中编码，appsink 单缓冲并丢旧帧，防止网络慢时堆帧。
+static bool write_all_fd(int fd, const uint8_t *p, size_t n) {
+    while (n) {
+        ssize_t k = write(fd, p, n);
+        if (k <= 0) return false;
+        p += k;
+        n -= (size_t)k;
+    }
+    return true;
+}
+
+static bool read_all_fd(int fd, uint8_t *p, size_t n) {
+    while (n) {
+        ssize_t k = read(fd, p, n);
+        if (k <= 0) return false;
+        p += k;
+        n -= (size_t)k;
+    }
+    return true;
+}
+
+// nvjpegenc 会加载与 UnitreeCameraSDK 内 OpenCV/libjpeg ABI 不兼容的 libjpeg。编码器因此
+// 放进不链接 SDK/OpenCV 的独立进程；父进程只做相机/去鱼眼，子进程独占 NVJPG 硬件编码。
 class NvJpegEncoder {
 public:
     NvJpegEncoder() = default;
@@ -75,95 +92,67 @@ public:
 
     bool encode(const cv::Mat &bgr, std::vector<uchar> &jpeg) {
         if (bgr.empty() || bgr.type() != CV_8UC3) return false;
-        if (!pipeline_ && !open(bgr.cols, bgr.rows)) return false;
+        if (worker_pid_ <= 0 && !open(bgr.cols, bgr.rows)) return false;
         if (bgr.cols != width_ || bgr.rows != height_) return false;
 
         const size_t bytes = bgr.total() * bgr.elemSize();
-        GstBuffer *in = gst_buffer_new_allocate(nullptr, bytes, nullptr);
-        if (!in) return false;
-        GstMapInfo in_map;
-        if (!gst_buffer_map(in, &in_map, GST_MAP_WRITE)) {
-            gst_buffer_unref(in);
-            return false;
-        }
-        // appsrc 必须在 gst_buffer 生命周期内拥有稳定内存；此处只做一次帧交接拷贝，JPEG
-        // 压缩实际由 nvjpegenc 的 NVJPG 硬件完成。
+        // 协议：[u32 BGR 字节数][BGR] → [u32 JPEG 字节数][JPEG]。只做进程间帧交接，
+        // JPEG 压缩在 nvjpeg_worker 的 NVJPG 硬件路径完成。
+        uint32_t in_n = htonl((uint32_t)bytes);
+        if (!write_all_fd(in_fd_, reinterpret_cast<uint8_t *>(&in_n), sizeof(in_n))) return false;
         if (bgr.isContinuous()) {
-            memcpy(in_map.data, bgr.data, bytes);
+            if (!write_all_fd(in_fd_, bgr.data, bytes)) return false;
         } else {
             const size_t row_bytes = (size_t)bgr.cols * bgr.elemSize();
             for (int y = 0; y < bgr.rows; ++y)
-                memcpy(in_map.data + (size_t)y * row_bytes, bgr.ptr(y), row_bytes);
+                if (!write_all_fd(in_fd_, bgr.ptr(y), row_bytes)) return false;
         }
-        gst_buffer_unmap(in, &in_map);
-
-        GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), in);
-        if (flow != GST_FLOW_OK) return false;  // push 后 buffer 所有权已移交 appsrc
-
-        GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appsink_), GST_SECOND);
-        if (!sample) return false;
-        GstBuffer *out = gst_sample_get_buffer(sample);
-        GstMapInfo out_map;
-        bool ok = out && gst_buffer_map(out, &out_map, GST_MAP_READ);
-        if (ok) {
-            jpeg.assign(out_map.data, out_map.data + out_map.size);
-            gst_buffer_unmap(out, &out_map);
-        }
-        gst_sample_unref(sample);
-        return ok && !jpeg.empty();
+        uint32_t out_n = 0;
+        if (!read_all_fd(out_fd_, reinterpret_cast<uint8_t *>(&out_n), sizeof(out_n))) return false;
+        const size_t jpeg_n = ntohl(out_n);
+        if (jpeg_n == 0 || jpeg_n > 8 * 1024 * 1024) return false;
+        jpeg.resize(jpeg_n);
+        return read_all_fd(out_fd_, jpeg.data(), jpeg.size());
     }
 
 private:
     bool open(int width, int height) {
-        GError *err = nullptr;
-        pipeline_ = gst_parse_launch(
-            "appsrc name=src is-live=true format=time block=true "
-            "! video/x-raw,format=BGR "
-            "! nvjpegenc quality=70 "
-            "! appsink name=sink sync=false max-buffers=1 drop=true",
-            &err);
-        if (!pipeline_) {
-            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 创建失败: %s\\n",
-                    err ? err->message : "unknown error");
-            if (err) g_error_free(err);
-            return false;
+        int to_worker[2], from_worker[2];
+        if (pipe(to_worker) || pipe(from_worker)) return false;
+        worker_pid_ = fork();
+        if (worker_pid_ == 0) {
+            dup2(to_worker[0], STDIN_FILENO);
+            dup2(from_worker[1], STDOUT_FILENO);
+            ::close(to_worker[0]); ::close(to_worker[1]);
+            ::close(from_worker[0]); ::close(from_worker[1]);
+            execl("bins/nvjpeg_worker", "nvjpeg_worker", std::to_string(width).c_str(),
+                  std::to_string(height).c_str(), (char *)nullptr);
+            _exit(127);
         }
-        appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "src");
-        appsink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
-        if (!appsrc_ || !appsink_) {
-            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 缺少 appsrc/appsink\\n");
-            close();
-            return false;
-        }
-        GstCaps *caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGR",
-                                             "width", G_TYPE_INT, width,
-                                             "height", G_TYPE_INT, height,
-                                             "framerate", GST_TYPE_FRACTION, 30, 1, nullptr);
-        g_object_set(appsrc_, "caps", caps, "stream-type", GST_APP_STREAM_TYPE_STREAM,
-                     "format", GST_FORMAT_TIME, nullptr);
-        gst_caps_unref(caps);
-        if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            fprintf(stderr, "[rgb_stream] nvjpegenc pipeline 无法启动\\n");
-            close();
-            return false;
-        }
+        if (worker_pid_ < 0) { ::close(to_worker[0]); ::close(to_worker[1]); ::close(from_worker[0]); ::close(from_worker[1]); return false; }
+        ::close(to_worker[0]); ::close(from_worker[1]);
+        in_fd_ = to_worker[1];
+        out_fd_ = from_worker[0];
         width_ = width;
         height_ = height;
-        fprintf(stderr, "[rgb_stream] JPEG 使用 Jetson NVJPG 硬件编码(nvjpegenc, quality=70)\\n");
+        fprintf(stderr, "[rgb_stream] JPEG 使用隔离 nvjpeg_worker 的 Jetson NVJPG 硬件编码(quality=70)\\n");
         return true;
     }
 
     void close() {
-        if (pipeline_) gst_element_set_state(pipeline_, GST_STATE_NULL);
-        if (appsrc_) gst_object_unref(appsrc_);
-        if (appsink_) gst_object_unref(appsink_);
-        if (pipeline_) gst_object_unref(pipeline_);
-        pipeline_ = appsrc_ = appsink_ = nullptr;
+        if (in_fd_ >= 0) ::close(in_fd_);
+        if (out_fd_ >= 0) ::close(out_fd_);
+        if (worker_pid_ > 0) {
+            int status = 0;
+            if (waitpid(worker_pid_, &status, WNOHANG) == 0) kill(worker_pid_, SIGTERM);
+            waitpid(worker_pid_, &status, 0);
+        }
+        worker_pid_ = -1;
+        in_fd_ = out_fd_ = -1;
     }
 
-    GstElement *pipeline_ = nullptr;
-    GstElement *appsrc_ = nullptr;
-    GstElement *appsink_ = nullptr;
+    pid_t worker_pid_ = -1;
+    int in_fd_ = -1, out_fd_ = -1;
     int width_ = 0, height_ = 0;
 };
 
@@ -440,7 +429,6 @@ static void serve_client(int cli, int device_id) {
 }
 
 int main(int argc, char *argv[]) {
-    gst_init(&argc, &argv);
     if (argc < 3) {
         fprintf(stderr, "用法: %s <port> <device_id>\n", argv[0]);
         _exit(1);
