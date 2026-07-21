@@ -67,11 +67,10 @@ COPY activity_monitor.py /work/activity_monitor.py
 COPY speaker.py        /work/speaker.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
-# Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
-#   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
+# Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Nano：
+#   beep_adapter.py / speaker_adapter.py（纯 Python）和 camera/（RGB、点云等 C++ 流服务）。
 COPY beep_adapter.py   /deploy/beep_adapter.py
 COPY speaker_adapter.py /deploy/speaker_adapter.py
-COPY camera_adapter/   /deploy/camera_adapter/
 # 点云:NX/Nano 侧 pointcloud_stream.cc 供 nano_bootstrap.sh 首启时分发+编译(镜像 depth_stream 的 SDK 路径)。
 COPY camera/           /deploy/camera/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
@@ -85,8 +84,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 15717
 
-# 首启时后台自动 provision Nano（部署 beep_adapter + 编译部署 camera_adapter），失败不阻塞驱动主进程；
-# 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
 # 首启时后台自动 provision Nano（部署 beep_adapter/speaker_adapter + 编译部署 camera/pointcloud），失败不阻塞；
 # 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
 # ⚠️ 先 source（用 ; 顺序执行，不放进后台），再把 bootstrap 丢后台，最后 exec 主进程——这样 main.py 才
