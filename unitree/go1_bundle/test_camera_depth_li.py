@@ -16,8 +16,8 @@ main.py 会按 config 自动 import 本模块并调用 make_plugin()，无需改
   │ depth_stream (C++ / UnitreeCameraSDK)       │        │ test_camera_depth_li.py                   │
   │  · 五路常驻 systemd 服务 (9101~9105)         │        │  · multiInstance sensor                   │
   │  · 空闲时只监听 TCP,不占相机                  │  TCP   │  · 卡 start → 连对应机位 910x              │
-  │  · 客户端连上才开相机(getDepthFrame 彩色深度图 │◀──────▶│    收 [4B 长度][JPEG] → 发                │
-  │    → JPEG) → 推流                           │ 图像流  │    CompressedImage 到                     │
+  │  · 客户端连上才开相机(getDepthFrame false     │◀──────▶│    收 [4B width][4B height][16UC1 raw] → │
+  │    原始深度 16UC1) → 推流                    │ 原始流  │    发布 Image (16UC1, mm) 到              │
   │  · 客户端断开 → _exit(0) 释放相机            │        │    /{ns}/camera/{position}/depth           │
   └─────────────────────────────────────────────┘        │  · stop → 断 TCP → Nano 释放相机           │
                                                           └───────────────────────────────────────────┘
@@ -84,7 +84,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# ── 单实例深度桥：连某机位 board_ip:depth_port 收 [4B 长度][JPEG] → 发布 CompressedImage ──
+# ── 单实例深度桥：连某机位 board_ip:depth_port 收 [4B width][4B height][16UC1 raw] → 发布 Image(16UC1, mm) ──
 
 class _DepthStream:
     """连板载 depth_stream，逐帧收原始16UC1深度数据发布到实例专属 topic。
@@ -193,6 +193,14 @@ class _DepthStream:
                         got_first = True
                         self._node.get_logger().info(
                             f"[{position}] 首帧到达 {latest_width}x{latest_height}, 进入稳态推流")
+                        # 校验深度帧尺寸：Go1 立体深度为 464x400（RectifyFrameSize），
+                        # 若偏差过大则说明协议不匹配（如 Nano 侧还在发旧版 JPEG 协议）。
+                        if latest_width < 200 or latest_width > 2000 or latest_height < 200 or latest_height > 2000:
+                            self._node.get_logger().error(
+                                f"[{position}] 深度帧尺寸异常 {latest_width}x{latest_height}，"
+                                f"期望 ~464x400。请检查 Nano 侧 depth_stream 是否为最新版本"
+                                f"（旧版发 JPEG 会被误读为异常尺寸）。断开重连。")
+                            break
 
                     # 发布节流只影响 ROS2 输出；接收端仍持续 drain TCP 队列，避免旧帧重新积压。
                     now_ms = int(time.time() * 1000)
