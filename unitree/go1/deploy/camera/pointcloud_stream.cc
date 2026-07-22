@@ -156,6 +156,9 @@ static void serve_client(int cli, int device_id, int stride) {
     cam.startCapture();
     cam.startStereoCompute();
 
+    // getCalibParams 需要 startCapture 后等参数初始化完成(同 rgb_stream)
+    usleep(200000);
+
     // 从 SDK 读内参和基线,动态构造 Q 矩阵
     // params[0]=LeftIntrinsicMatrix(fx/cx/cy), params[4]=Translation(Tx,单位 mm)
     float fx = FX_DEFAULT, cx = CX_DEFAULT, cy = CY_DEFAULT, Tx = TX_DEFAULT;

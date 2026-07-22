@@ -123,6 +123,9 @@ except ImportError:
 
 _PCL_W, _PCL_H = 480, 480
 _PCL_R = 2
+_PCL_CIRCLE = [(dx, dy) for dy in range(-_PCL_R, _PCL_R + 1)
+               for dx in range(-_PCL_R, _PCL_R + 1)
+               if dx * dx + dy * dy <= _PCL_R * _PCL_R]
 _PCL_XR, _PCL_YR = 4.0, 3.0
 _PCL_ZMIN, _PCL_ZMAX = 0.3, 5.0
 
@@ -151,17 +154,16 @@ def _pcl_to_jpeg(xyz_blob: bytes, num_points: int) -> bytes | None:
         px = np.clip(((x + _PCL_XR / 2) / _PCL_XR * (_PCL_W - 1)).astype(np.int32), 0, _PCL_W - 1)
         py = np.clip(((y + _PCL_YR / 2) / _PCL_YR * (_PCL_H - 1)).astype(np.int32), 0, _PCL_H - 1)
         t_arr = np.clip((z - _PCL_ZMIN) / (_PCL_ZMAX - _PCL_ZMIN), 0, 1)
-        colors = np.zeros((len(px), 3), dtype=np.uint8)
-        for i in range(len(px)):
-            colors[i] = tuple(int(v * 255) for v in _pcl_jet_t(t_arr[i]))
-        for i in range(len(px)):
-            x0, y0 = int(px[i]), int(py[i])
-            for dy in range(-_PCL_R, _PCL_R + 1):
-                for dx in range(-_PCL_R, _PCL_R + 1):
-                    if dx * dx + dy * dy <= _PCL_R * _PCL_R:
-                        xi, yi = x0 + dx, y0 + dy
-                        if 0 <= xi < _PCL_W and 0 <= yi < _PCL_H:
-                            img[yi, xi] = colors[i]
+        # Vectorized jet colormap
+        r = np.clip(1.5 - np.abs(4 * t_arr - 3), 0, 1)
+        g = np.clip(1.5 - np.abs(4 * t_arr - 2), 0, 1)
+        b = np.clip(1.5 - np.abs(4 * t_arr - 1), 0, 1)
+        colors = (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
+        # Draw filled circles via precomputed offsets (13 batch ops vs ~290k Python iterations)
+        for dx, dy in _PCL_CIRCLE:
+            xi = np.clip(px + dx, 0, _PCL_W - 1)
+            yi = np.clip(py + dy, 0, _PCL_H - 1)
+            img[yi, xi] = colors
     buf = __import__('io').BytesIO()
     _PILImage.fromarray(img).save(buf, format="JPEG", quality=75)
     return buf.getvalue()
@@ -381,6 +383,9 @@ class _PclStream(_BaseStream):
         self._pub_pcl = node.create_publisher(PointCloud2, topic_pcl, _QOS) if _HAS_ROS2 else None
         self._pub_jpeg = node.create_publisher(CompressedImage, topic_preview, _QOS) if (_HAS_ROS2 and _HAS_PIL) else None
         self.last_points = 0
+        self._last_publish_ms = 0
+        self._MIN_INTERVAL_MS = 100       # 最多发布约 10Hz(匹配 C++ 端 usleep(100000))
+        self._MAX_DRAIN_BYTES = 1_048_576
 
     def _make_pcl_msg(self, num_points: int, xyz_blob: bytes):
         msg = PointCloud2()
@@ -401,34 +406,74 @@ class _PclStream(_BaseStream):
         return msg
 
     def _loop(self, gen, position, host, port):
-        t_connect, t_first, t_steady = 8.0, 15.0, 8.0
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=t_connect)
-                s.settimeout(t_first)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
                 self.connected = True
                 if self._node:
-                    self._node.get_logger().info(f"[{position}] 已连 pointcloud_stream {host}:{port}")
+                    self._node.get_logger().info(
+                        f"[{position}] 已连 pointcloud_stream {host}:{port}(等第一帧)")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    total = struct.unpack(">I", hdr)[0]
-                    if total < 4 or total > 50_000_000:
-                        break
-                    payload = _recvall(s, total)
-                    if payload is None:
-                        break
-                    num_points = struct.unpack(">I", payload[:4])[0]
-                    xyz_blob = payload[4:]
+
+                    # 丢弃本批次中已过期的完整帧，仅留下最后一帧待发布；不完整尾帧保留到下一次 recv。
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 4:
+                        total = struct.unpack(">I", rx[:4])[0]
+                        if total < 4 or total > 50_000_000:
+                            raise ValueError(f"invalid pcl frame length: {total}")
+                        end = 4 + total
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
+                    num_points = struct.unpack(">I", latest[:4])[0]
+                    xyz_blob = latest[4:]
                     if len(xyz_blob) != num_points * 12:
                         continue
+
+                    if not got_first:
+                        got_first = True
+                        if self._node:
+                            self._node.get_logger().info(f"[{position}] 首帧到达,进入稳态推流")
+
+                    # 发布节流只影响 ROS2 输出；接收端仍持续 drain TCP 队列，避免旧帧重新积压。
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        continue
+
                     if self._pub_pcl is not None:
                         self._pub_pcl.publish(self._make_pcl_msg(num_points, xyz_blob))
                     if self._pub_jpeg is not None:
@@ -443,13 +488,8 @@ class _PclStream(_BaseStream):
                                 self._pub_jpeg.publish(pmsg)
                             except Exception:
                                 pass
-                    self.frames += 1
                     self.last_points = num_points
-                    if not got_first:
-                        got_first = True
-                        s.settimeout(t_steady)
-                        if self._node:
-                            self._node.get_logger().info(f"[{position}] 首帧到达")
+                    self._last_publish_ms = now_ms
             except Exception as e:  # noqa: BLE001
                 if self._node:
                     self._node.get_logger().warn(f"[{position}] pointcloud stream 中断: {e}")
