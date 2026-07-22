@@ -122,7 +122,7 @@ static void disp_to_xyz(const cv::Mat &disp, const cv::Mat &Q, int stride,
     for (int v = 0; v < rows; v += stride) {
         for (int u = 0; u < cols; u += stride) {
             const cv::Vec3f &p = xyz_map.at<cv::Vec3f>(v, u);
-            float x = p[0], y = p[1], z = p[2];
+            float x = p[0], y = -p[1], z = p[2];  // 翻转 y: 图像 v 向下→相机系 y 向上
             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
                 cnt_inf++;
                 continue;
