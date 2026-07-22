@@ -104,19 +104,32 @@ static void serve_client(int cli, int device_id) {
         cv::Mat depth;
         std::chrono::microseconds t;
         // 获取原始深度数据(第二个参数 false),不进行彩色化
-        if (!cam.getDepthFrame(depth, false, t) || depth.empty()) {
+        if (!cam.getDepthFrame(depth, false, t)) {
+            usleep(2000);
+            continue;
+        }
+        // 严格校验: depth 必须是非空、连续内存的单通道/多通道矩阵
+        // (getDepthFrame 返回 true 但矩阵损坏时, cols/rows 可能是垃圾值)
+        if (depth.empty() || !depth.isContinuous() || depth.cols <= 0 || depth.rows <= 0 || depth.cols > 2000 || depth.rows > 2000) {
+            fprintf(stderr, "[depth_stream] 无效帧: empty=%d isCont=%d cols=%d rows=%d channels=%d\n",
+                    depth.empty(), depth.isContinuous(), depth.cols, depth.rows, depth.channels());
             usleep(2000);
             continue;
         }
         cv::flip(depth, depth, 0);   // 上下翻转(待验证:若仍左右反则改 -1)
 
-        // 发送协议头: [4B宽度][4B高度]
-        uint32_t width = htonl((uint32_t)depth.cols);
-        uint32_t height = htonl((uint32_t)depth.rows);
-        size_t data_size = depth.total() * depth.elemSize();  // 640*400*2 = 512000 字节 (16UC1)
+        uint32_t width = (uint32_t)depth.cols;
+        uint32_t height = (uint32_t)depth.rows;
+        fprintf(stderr, "[depth_stream] 帧尺寸: %u x %u, total=%zu, elemSize=%zu\n",
+                width, height, depth.total(), depth.elemSize());
 
-        if (!send_all(cli, reinterpret_cast<uint8_t *>(&width), 4)) break;
-        if (!send_all(cli, reinterpret_cast<uint8_t *>(&height), 4)) break;
+        // 发送协议头: [4B宽度][4B高度] (大端序)
+        uint32_t width_be = htonl(width);
+        uint32_t height_be = htonl(height);
+        size_t data_size = depth.total() * depth.elemSize();  // 464*400*2 = 371200 字节 (16UC1)
+
+        if (!send_all(cli, reinterpret_cast<uint8_t *>(&width_be), 4)) break;
+        if (!send_all(cli, reinterpret_cast<uint8_t *>(&height_be), 4)) break;
         if (!send_all(cli, depth.data, data_size)) break;
 
         usleep(50000);   // ~20Hz 上限(实际受深度计算限速)

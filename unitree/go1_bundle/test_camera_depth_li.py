@@ -168,8 +168,15 @@ class _DepthStream:
                         width = struct.unpack(">I", rx[:4])[0]
                         height = struct.unpack(">I", rx[4:8])[0]
                         data_size = width * height * 2  # 16UC1 = 2字节/像素
-                        if data_size <= 0 or data_size > 5_000_000:
-                            raise ValueError(f"invalid depth frame size: {width}x{height} -> {data_size} bytes")
+
+                        # 预期深度分辨率 ~464x400 → data_size ≈ 371200；放宽到 50KB~2MB 可覆盖所有合法帧。
+                        # 超出范围说明读到了垃圾数据（字节序错误或SDK返回畸形帧），丢弃8字节头尝试重新同步，
+                        # 而不是直接 raise 导致整条 TCP 连接断开重连。
+                        if data_size <= 0 or data_size > 2_000_000 or data_size < 50_000:
+                            self._node.get_logger().debug(
+                                "[%s] 异常头 %dx%d=%dB, 丢弃8字节同步", position, width, height, data_size)
+                            del rx[:8]
+                            continue
                         end = 8 + data_size
                         if len(rx) < end:
                             break
@@ -184,7 +191,8 @@ class _DepthStream:
 
                     if not got_first:
                         got_first = True
-                        self._node.get_logger().info(f"[{position}] 首帧到达，进入稳态推流")
+                        self._node.get_logger().info(
+                            f"[{position}] 首帧到达 {latest_width}x{latest_height}, 进入稳态推流")
 
                     # 发布节流只影响 ROS2 输出；接收端仍持续 drain TCP 队列，避免旧帧重新积压。
                     now_ms = int(time.time() * 1000)
