@@ -174,7 +174,7 @@ class _DepthStream:
                         # 而不是直接 raise 导致整条 TCP 连接断开重连。
                         if data_size <= 0 or data_size > 2_000_000 or data_size < 50_000:
                             self._node.get_logger().debug(
-                                "[%s] 异常头 %dx%d=%dB, 丢弃8字节同步", position, width, height, data_size)
+                                "[{}] 异常头 {}x{}={:.0f}B, 丢弃8字节同步".format(position, width, height, data_size))
                             del rx[:8]
                             continue
                         end = 8 + data_size
