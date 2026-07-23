@@ -108,7 +108,6 @@ static void serve_client(int cli, int device_id) {
             usleep(2000);
             continue;
         }
-        cv::flip(depth, depth, -1);   // 旋转180°(上下+左右翻转,对齐rgb_stream处理方式,适配Go1相机倒装)
         std::vector<uchar> buf;
         cv::imencode(".jpg", depth, buf, jpgparams);
         uint32_t n = htonl((uint32_t)buf.size());
