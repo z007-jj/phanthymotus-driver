@@ -32,8 +32,14 @@ import select
 import struct
 import threading
 import time
-import cv2
-import numpy as np
+
+# 可选依赖：opencv用于图像翻转，不存在则跳过翻转逻辑避免卡片加载失败
+try:
+    import cv2
+    import numpy as np
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
 
 try:
     from rclpy.node import Node
@@ -186,11 +192,12 @@ class _DepthStream:
                         continue
 
                     if self._pub is not None:
-                        # 解码JPEG → 上下翻转 → 重新编码（解决深度图上下颠倒问题）
-                        img = cv2.imdecode(np.frombuffer(latest, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        img = cv2.flip(img, 0)  # 0=上下翻转，1=左右翻转，-1=旋转180°
-                        _, encoded = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                        latest = encoded.tobytes()
+                        # 如果安装了opencv则翻转图像解决上下颠倒问题，否则直接发布
+                        if _HAS_CV2:
+                            img = cv2.imdecode(np.frombuffer(latest, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            img = cv2.flip(img, 0)  # 0=上下翻转，1=左右翻转，-1=旋转180°
+                            _, encoded = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                            latest = encoded.tobytes()
 
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
