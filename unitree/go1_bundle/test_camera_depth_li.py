@@ -195,7 +195,6 @@ class _DepthStream:
                         # 如果安装了opencv则翻转图像解决上下颠倒问题，否则直接发布
                         if _HAS_CV2:
                             img = cv2.imdecode(np.frombuffer(latest, dtype=np.uint8), cv2.IMREAD_COLOR)
-                            img = cv2.flip(img, 0)  # 0=上下翻转，1=左右翻转，-1=旋转180°
                             _, encoded = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                             latest = encoded.tobytes()
 
