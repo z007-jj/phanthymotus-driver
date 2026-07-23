@@ -32,6 +32,8 @@ import select
 import struct
 import threading
 import time
+import cv2
+import numpy as np
 
 try:
     from rclpy.node import Node
@@ -184,6 +186,12 @@ class _DepthStream:
                         continue
 
                     if self._pub is not None:
+                        # 解码JPEG → 上下翻转 → 重新编码（解决深度图上下颠倒问题）
+                        img = cv2.imdecode(np.frombuffer(latest, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        img = cv2.flip(img, 0)  # 0=上下翻转，1=左右翻转，-1=旋转180°
+                        _, encoded = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                        latest = encoded.tobytes()
+
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
