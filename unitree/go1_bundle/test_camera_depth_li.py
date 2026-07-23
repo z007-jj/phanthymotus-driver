@@ -16,8 +16,8 @@ main.py 会按 config 自动 import 本模块并调用 make_plugin()，无需改
   │ depth_stream (C++ / UnitreeCameraSDK)       │        │ test_camera_depth_li.py                   │
   │  · 五路常驻 systemd 服务 (9101~9105)         │        │  · multiInstance sensor                   │
   │  · 空闲时只监听 TCP,不占相机                  │  TCP   │  · 卡 start → 连对应机位 910x              │
-  │  · 客户端连上才开相机(getDepthFrame false     │◀──────▶│    收 [4B width][4B height][16UC1 raw] → │
-  │    原始深度 16UC1) → 推流                    │ 原始流  │    发布 Image (16UC1, mm) 到              │
+  │  · 客户端连上才开相机(getDepthFrame 彩色深度图 │◀──────▶│    收 [4B 长度][JPEG] → 发                │
+  │    → JPEG) → 推流                           │ 图像流  │    CompressedImage 到                     │
   │  · 客户端断开 → _exit(0) 释放相机            │        │    /{ns}/camera/{position}/depth           │
   └─────────────────────────────────────────────┘        │  · stop → 断 TCP → Nano 释放相机           │
                                                           └───────────────────────────────────────────┘
@@ -36,7 +36,7 @@ import time
 try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import CompressedImage
     _HAS_ROS2 = True
     _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -47,7 +47,7 @@ except Exception:
 
 CARD = "test_camera_depth_li"
 TYPE = "sensor"
-FMT = "image/depth-z16"
+FMT = "image/jpeg"
 
 # 超时分三段：连接短、等首帧宽松、稳态收紧。
 #   depth_stream SDK 初始化约 3~4s，首帧略快于 rgb_stream，但仍需给足余量。
@@ -68,10 +68,9 @@ _POS_TITLE = {"front": "Front (头部前 dev1)", "chin": "Chin (头部下 dev0)"
               "left": "Left (侧左 dev0)", "right": "Right (侧右 dev1)", "belly": "Belly (腹部 dev0)"}
 _VALID_POSITIONS = list(_DEFAULT_POSITIONS.keys())
 
-DESC = ("Go1 五机位深度流（~10Hz，原始16UC1深度，毫米）— multiInstance，position 下拉框选机位。"
-        "Nano 侧 depth_stream(getDepthFrame, false) 推送原始深度数据，"
-        "TCP 收帧桥接到 ROS2 sensor_msgs/Image (16UC1)。"
-        "每像素为毫米距离值，可直接用于测距和避障算法（对齐 G1 RealSense 实现）。"
+DESC = ("Go1 五机位深度流（~10Hz，彩色 JPEG：近红/远青）— multiInstance，position 下拉框选机位。"
+        "Nano 侧 depth_stream(getDepthFrame) 按需开相机（连才开/断即放），"
+        "TCP 收帧桥接到 ROS2 sensor_msgs/CompressedImage。"
         "start=连接并推流 / stop=断开并释放相机 / config.position=热切机位（~3-4s 首帧）。"
         "一次一路（立体重运算）；与点云指向同一相机时互斥（谁连谁占）。")
 
@@ -84,10 +83,10 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# ── 单实例深度桥：连某机位 board_ip:depth_port 收 [4B width][4B height][16UC1 raw] → 发布 Image(16UC1, mm) ──
+# ── 单实例深度桥：连某机位 board_ip:depth_port 收 [4B 长度][JPEG] → 发布 CompressedImage ──
 
 class _DepthStream:
-    """连板载 depth_stream，逐帧收原始16UC1深度数据发布到实例专属 topic。
+    """连板载 depth_stream，逐帧收彩色深度 JPEG 发布到实例专属 topic。
 
     连上才开相机（Nano 侧），断开即释放（同 camera_rgb 路线）。
     """
@@ -95,7 +94,7 @@ class _DepthStream:
     def __init__(self, node: "Node", topic: str):
         self._node = node
         self._topic = topic
-        self._pub = node.create_publisher(Image, topic, _QOS) if _HAS_ROS2 else None
+        self._pub = node.create_publisher(CompressedImage, topic, _QOS) if _HAS_ROS2 else None
         self._run = False
         self._gen = 0
         self.connected = False
@@ -159,30 +158,16 @@ class _DepthStream:
                         break
 
                     # 丢弃本批次中已过期的完整帧，仅留下最后一帧待发布；不完整尾帧保留到下一次 recv。
-                    # 新协议: [4B宽度][4B高度][N字节16UC1数据]
                     latest = None
                     complete_frames = 0
-                    latest_width = 0
-                    latest_height = 0
-                    while len(rx) >= 8:  # 8字节 = 4B宽度 + 4B高度
-                        width = struct.unpack(">I", rx[:4])[0]
-                        height = struct.unpack(">I", rx[4:8])[0]
-                        data_size = width * height * 2  # 16UC1 = 2字节/像素
-
-                        # 预期深度分辨率 ~464x400 → data_size ≈ 371200；放宽到 50KB~2MB 可覆盖所有合法帧。
-                        # 超出范围说明读到了垃圾数据（字节序错误或SDK返回畸形帧），丢弃8字节头尝试重新同步，
-                        # 而不是直接 raise 导致整条 TCP 连接断开重连。
-                        if data_size <= 0 or data_size > 2_000_000 or data_size < 50_000:
-                            self._node.get_logger().debug(
-                                "[{}] 异常头 {}x{}={:.0f}B, 丢弃8字节同步".format(position, width, height, data_size))
-                            del rx[:8]
-                            continue
-                        end = 8 + data_size
+                    while len(rx) >= 4:
+                        n = struct.unpack(">I", rx[:4])[0]
+                        if n <= 0 or n > 5_000_000:
+                            raise ValueError(f"invalid JPEG frame length: {n}")
+                        end = 4 + n
                         if len(rx) < end:
                             break
-                        latest = bytes(rx[8:end])  # 原始深度数据
-                        latest_width = width
-                        latest_height = height
+                        latest = bytes(rx[4:end])
                         del rx[:end]
                         complete_frames += 1
                     self.frames += complete_frames
@@ -191,16 +176,7 @@ class _DepthStream:
 
                     if not got_first:
                         got_first = True
-                        self._node.get_logger().info(
-                            f"[{position}] 首帧到达 {latest_width}x{latest_height}, 进入稳态推流")
-                        # 校验深度帧尺寸：Go1 立体深度为 464x400（RectifyFrameSize），
-                        # 若偏差过大则说明协议不匹配（如 Nano 侧还在发旧版 JPEG 协议）。
-                        if latest_width < 200 or latest_width > 2000 or latest_height < 200 or latest_height > 2000:
-                            self._node.get_logger().error(
-                                f"[{position}] 深度帧尺寸异常 {latest_width}x{latest_height}，"
-                                f"期望 ~464x400。请检查 Nano 侧 depth_stream 是否为最新版本"
-                                f"（旧版发 JPEG 会被误读为异常尺寸）。断开重连。")
-                            break
+                        self._node.get_logger().info(f"[{position}] 首帧到达，进入稳态推流")
 
                     # 发布节流只影响 ROS2 输出；接收端仍持续 drain TCP 队列，避免旧帧重新积压。
                     now_ms = int(time.time() * 1000)
@@ -208,15 +184,11 @@ class _DepthStream:
                         continue
 
                     if self._pub is not None:
-                        msg = Image()
+                        msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
-                        msg.encoding = "16UC1"
-                        msg.height = latest_height
-                        msg.width = latest_width
-                        msg.is_bigendian = 0
-                        msg.step = latest_width * 2  # 16-bit = 2字节/像素
-                        msg.data = list(latest)  # 原始深度数据
+                        msg.format = "jpeg"
+                        msg.data = latest
                         try:
                             self._pub.publish(msg)
                             self._last_publish_ms = now_ms
@@ -235,12 +207,10 @@ class _DepthStream:
 # ── CameraDepthPlugin (multiInstance sensor) ─────────────────────────────────
 
 class CameraDepthPlugin:
-    """Go1 `test_camera_depth_li` 深度视觉扩展卡（原始深度版本）。
+    """Go1 `test_camera_depth_li` 深度视觉扩展卡。
 
     multiInstance：每张画布卡实例用 instance_id 区分，各自选一个 position、各自一条 topic
     `/{ns}/camera/{position}/depth`。公共默认机位由 config.default_position 给（拖入前用）。
-
-    推送原始 16UC1 深度数据（毫米单位），可直接用于测距和避障算法（对齐 G1 RealSense 实现）。
 
     关键修复（对比 test_camera_depth）：
       _resolve_pos() 当无显式 position 时，先尝试以 iid 作为机位名（平台 instance_id 通常
@@ -324,7 +294,7 @@ class CameraDepthPlugin:
     def get_tools(self) -> list:
         return [{
             "name": CARD, "type": TYPE, "multiInstance": True,
-            "description": DESC + (" — ROS2 Image (16UC1)" if self._node else " — no rclpy, poll via MCP"),
+            "description": DESC + (" — ROS2 CompressedImage" if self._node else " — no rclpy, poll via MCP"),
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -377,14 +347,14 @@ class CameraDepthPlugin:
             base = {
                 "state": state, "position": pos,
                 "positions_available": _VALID_POSITIONS,
-                "format": "sensor_msgs/Image (16UC1, raw depth in mm)",
+                "format": "sensor_msgs/CompressedImage (jpeg, colorized depth: red=near/cyan=far)",
                 "source": f"{pos} @ {p.get('board_ip')}:{p.get('depth_port')} (depth_stream)",
                 "connected_to_nano": bool(st and st.connected),
                 "frames_published": st.frames if st else 0,
                 "topic_out": [{"topic": self._topic(iid), "format": FMT}] if self._node else [],
             }
             if state == "running":
-                base["note"] = "streaming raw 16UC1 depth (mm); stop to release camera"
+                base["note"] = "streaming colorized depth JPEG; stop to release camera"
             else:
                 base["note"] = "start to connect (Nano opens camera on connect); stop releases it"
             return base
