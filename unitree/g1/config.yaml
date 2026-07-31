@@ -38,7 +38,7 @@ plugins:
 safety_harness:
   enabled: true
   decel_threshold: 2.0
-  stop_threshold: 0.8
+  stop_threshold: 1.2
   lateral_threshold: 0.8
   cone_half_angle: 30
   z_min: 0.1

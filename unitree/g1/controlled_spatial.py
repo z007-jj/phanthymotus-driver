@@ -340,7 +340,7 @@ class ControlledSpatialPlugin:
                     "yaw": {"type": "number", "description": "Target yaw (radians)"},
                     "speed": {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
                     "mode": {"type": "integer", "description": "Obstacle mode: 1=stop(default), 0=detour"},
-                    "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 60)"},
+                    "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 90)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -352,9 +352,9 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place. mode: 1=stop-on-obstacle (default), 0=detour. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates. mode: 1=stop-on-obstacle (default), 0=detour. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds). Must be called after navigate_to_tag or navigate_to_pose."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place (non-blocking). mode: 1=stop-on-obstacle (default), 0=detour. MUST be followed by a separate wait_navigation_done call in the same turn to wait for arrival before proceeding."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates (non-blocking). mode: 1=stop-on-obstacle (default), 0=detour. MUST be followed by a separate wait_navigation_done call in the same turn to wait for arrival before proceeding."},
+                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until the previous navigate_to_tag or navigate_to_pose completes. Returns on arrival, timeout, or error. Always call after navigate_to_tag/navigate_to_pose."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -576,6 +576,8 @@ class ControlledSpatialPlugin:
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
                 mode = int(args.get("mode", 1))
+                if mode != 1:
+                    mode = 1  # 强制停障模式，不允许绕障
                 # Non-blocking: sends NavigateTo RPC and returns immediately.
                 # LLM agent must call wait_navigation_done to wait for arrival.
                 self._nav_arrived.clear()
@@ -588,6 +590,8 @@ class ControlledSpatialPlugin:
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
             mode = int(args.get("mode", 1))
+            if mode != 1:
+                mode = 1  # 强制停障模式，不允许绕障
             self._nav_arrived.clear()
             self._nav_error = None
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
@@ -603,6 +607,8 @@ class ControlledSpatialPlugin:
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
                 mode = int(args.get("mode", 1))
+                if mode != 1:
+                    mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
                 return self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)

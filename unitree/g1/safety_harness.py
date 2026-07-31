@@ -613,6 +613,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             do_stop("command")
         elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             do_stop_nav()
+            # Wait for PauseNav to take effect in SLAM service before issuing new NavigateTo.
+            time.sleep(0.5)
 
         # Reset arrival state for this navigation session
         with slam_info_lock:
@@ -628,8 +630,28 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             slam_client.ResumeNav()
         except Exception:
             pass
-        code, resp = slam_client.NavigateTo(x, y, 0, 0, 0, q_z, q_w,
-                                              speed=speed, mode=mode)
+        # Wait for SLAM service to fully process ResumeNav before issuing NavigateTo.
+        # Without this delay, NavigateTo arrives while SLAM is still transitioning
+        # out of paused state, causing 3104 (request timeout) on long-distance targets.
+        time.sleep(0.3)
+
+        # Retry NavigateTo up to 3 times on timeout (3104). Each retry re-issues
+        # ResumeNav to ensure SLAM service is in a clean state.
+        last_code, last_resp = 0, None
+        for attempt in range(3):
+            last_code, last_resp = slam_client.NavigateTo(x, y, 0, 0, 0, q_z, q_w,
+                                                          speed=speed, mode=mode)
+            if last_code == 0:
+                break
+            if last_code == 3104 and attempt < 2:
+                print(f"[SmartMotion] NavigateTo timeout (attempt {attempt+1}), retrying...", flush=True)
+                time.sleep(0.5)
+                try:
+                    slam_client.ResumeNav()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+        code, resp = last_code, last_resp
 
         if code != 0:
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
@@ -834,13 +856,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
-            # In mode=1 (stop-on-obstacle), SLAM service handles obstacle stopping.
-            # No local PauseNav/ResumeNav needed — avoids conflicts with SLAM state.
+            # Delegate obstacle handling to SLAM service (mode=1).
+            # Do NOT trigger PauseNav here to avoid dual-controller conflict
+            # that causes "halfway stop" and repeated 3104 errors.
             pass
 
         elif state == MotionState.NAV_PAUSED:
             # Obstacle cleared — resume navigation.
-            # Only resume if we were paused by local obstacle detection.
             if dist > decel_threshold and not lateral:
                 try:
                     slam_client.ResumeNav()

@@ -223,7 +223,10 @@ class NativeTtsPlugin:
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
-            ret   = self._client.TtsMaker(text, voice)
+            # Retry on timeout (ret=3104) to hide ROS2 RPC channel contention
+            ret = self._client.TtsMaker(text, voice)
+            if ret != 0:
+                ret = self._client.TtsMaker(text, voice)
             return {"ret": ret, "text": text}
         elif action == "get_volume":
             ret = self._client.GetVolume()
