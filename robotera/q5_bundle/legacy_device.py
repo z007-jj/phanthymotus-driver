@@ -202,14 +202,10 @@ rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 pending = bytearray()
-# Handle and submit fixed 300 ms PCM blocks, matching the stable Unitree live
-# speaker strategy.  The bridge has shown gaps up to 262 ms, so prefill two
-# blocks before opening the audio gate.  This avoids USB-card underruns caused
-# by scheduling a separate ALSA write for every arbitrary transport fragment.
-# Keep only one 100 ms transport block queued before opening the ALSA gate.
-# This cuts the old ~600 ms startup delay to about 200 ms while retaining
-# enough buffering for the remote bridge's short scheduling gaps.
-input_block_bytes = 3200
+# Use the original verified live-speaker cadence. The remote DDS/SSH path can
+# pause for over 250 ms; 600 ms blocks and a two-block prefill keep this USB
+# ALSA device fed instead of repeatedly dropping into an inaudible underrun.
+input_block_bytes = 9600
 prefill_bytes = input_block_bytes * 2
 try:
   while True:
@@ -756,12 +752,12 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. Keep the full distance range readable
-            # with a light, low-saturation palette; invalid pixels stay black.
+            # D455 Z16 is millimetres. Render distance on a single polished
+            # ivory-to-teal scale; invalid pixels stay black.
             normalized = self._np.clip((depth - 250.0) / 4750.0, 0.0, 1.0)
             stops = self._np.array([
-                (255, 246, 220), (255, 214, 190), (230, 202, 238),
-                (191, 215, 245), (129, 170, 220),
+                (255, 251, 238), (222, 239, 238), (158, 207, 201),
+                (87, 160, 167), (37, 104, 130),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)
@@ -870,9 +866,9 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
             body_up = cosine * camera_up - sine * z + self._floor_offset_m
             body_forward = sine * camera_up + cosine * z
             # Agent Core's point-cloud renderer maps packet (x, y, z) to
-            # display (y, -z, -x). Pack Q5 body coordinates as
-            # (-forward, right, -up), producing display (right, up, forward).
-            points = self._np.stack((-body_forward, camera_x, -body_up), axis=-1)[valid]
+            # display (y, -z, -x). The renderer's horizontal convention is
+            # opposite the D455 optical axis, so mirror camera-right here.
+            points = self._np.stack((-body_forward, -camera_x, -body_up), axis=-1)[valid]
             if not len(points):
                 return
             points = self._np.ascontiguousarray(points.astype("<f4", copy=False))
