@@ -366,7 +366,8 @@ class SpeakerPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "set_volume", "stop", "info"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
-                "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100},
+                "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100,
+                           "default": self._volume},
             }, "required": ["action"], "additionalProperties": False},
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
@@ -479,13 +480,13 @@ class SpeakerPlugin:
                         "message": "Connect an audio/pcm-16k output to speaker before starting playback"}
             self._start_for_topic(requested)
         elif action == "set_volume":
-            value = args.get("volume")
+            value = args.get("volume", self._volume)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
                 return {"ok": False, "code": "INVALID_VOLUME", "message": "volume must be an integer from 0 to 100"}
             self._volume = value
         elif action == "stop":
             self.stop()
-        if action in ("start", "stop", "info"):
+        if action in ("start", "set_volume", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_in": ([{"topic": self._topic, "format": "audio/pcm-16k"}]
                                  if self._topic else [{"format": "audio/pcm-16k"}]),
@@ -753,22 +754,19 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. Map 0.25-5.0 m to an intuitive
-            # near-red -> yellow/green -> far-blue palette; invalid depth is
-            # black. Keep the wire format as JPEG for frontend compatibility.
+            # D455 Z16 is millimetres. Use a restrained perceptual palette:
+            # near is warm gold, middle distances move through rose/violet,
+            # and far is deep indigo. Invalid pixels remain black.
             normalized = self._np.clip((depth - 250.0) / 4750.0, 0.0, 1.0)
-            hue = normalized * 0.66
-            h6 = hue * 6.0
-            sector = self._np.floor(h6).astype(self._np.int16)
-            frac = h6 - sector
-            q = (1.0 - frac) * 255.0
-            t = frac * 255.0
-            color = self._np.zeros((depth.shape[0], depth.shape[1], 3), dtype=self._np.uint8)
-            masks = [sector == i for i in range(6)]
-            rgb = [(255, t, 0), (q, 255, 0), (0, 255, t), (0, q, 255), (t, 0, 255), (255, 0, q)]
-            for mask, values in zip(masks, rgb):
-                for channel, value in enumerate(values):
-                    color[..., channel][mask] = self._np.asarray(value, dtype=self._np.uint8)[mask] if hasattr(value, "shape") else value
+            stops = self._np.array([
+                (255, 230, 170), (253, 148, 95), (208, 70, 110),
+                (93, 38, 110), (18, 22, 50),
+            ], dtype=self._np.float32)
+            scaled = normalized * (len(stops) - 1)
+            lower = self._np.floor(scaled).astype(self._np.intp)
+            upper = self._np.minimum(lower + 1, len(stops) - 1)
+            fraction = (scaled - lower)[..., None]
+            color = ((1.0 - fraction) * stops[lower] + fraction * stops[upper]).astype(self._np.uint8)
             color[depth <= 0] = 0
             encoded = io.BytesIO()
             self._pil_image.fromarray(color, "RGB").save(encoded, format="JPEG", quality=75)
@@ -804,7 +802,7 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_pointcloud", "type": "sensor", "multiInstance": False,
-            "description": f"Q5 D455 aligned-depth XYZ point cloud in the color-camera optical frame. Limited to {self._max_points:,} points/frame; this is a forward-facing camera cloud, not 360-degree lidar.",
+            "description": f"Q5 D455 aligned-depth XYZ point cloud, rendered as a forward-facing camera view. Limited to {self._max_points:,} points/frame; this is not 360-degree lidar.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -855,8 +853,12 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
             rows *= stride
             cols *= stride
             fx, fy, cx, cy = intrinsics
-            points = self._np.stack(
-                ((cols - cx) * z / fx, (rows - cy) * z / fy, z), axis=-1)[valid]
+            camera_x = (cols - cx) * z / fx  # right
+            camera_y = (rows - cy) * z / fy  # down
+            # Agent Core's point-cloud renderer maps packet (x, y, z) to
+            # display (y, -z, -x). Pack the camera optical frame as
+            # (-forward, right, down), producing display (right, up, forward).
+            points = self._np.stack((-z, camera_x, camera_y), axis=-1)[valid]
             if not len(points):
                 return
             points = self._np.ascontiguousarray(points.astype("<f4", copy=False))
