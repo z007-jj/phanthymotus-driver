@@ -13,6 +13,7 @@ import binascii
 import os
 import re
 import shlex
+import struct
 import subprocess
 import threading
 import time
@@ -774,6 +775,95 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             self._send_media({"kind": "depth_jpeg", "data": encoded.getvalue()})
         except Exception as exc:
             self._node.get_logger().warn(f"Depth preview encode failed: {exc}")
+            return
+        self._frames_sent += 1
+        self._last_sent = time.monotonic()
+
+
+class CameraPointCloudPlugin(_Q5MediaPlugin):
+    """Reconstruct a bounded XYZ cloud from D455 aligned depth and intrinsics."""
+
+    _node_name = "q5_camera_pointcloud"
+    _format = "sensor/pointcloud"
+
+    def __init__(self, plugin_config, namespace, executor, client):
+        self._source_topic = str(plugin_config.get(
+            "source_topic", "/camera/camera/aligned_depth_to_color/image_raw"))
+        self._info_topic = str(plugin_config.get(
+            "camera_info_topic", "/camera/camera/color/camera_info"))
+        self._topic = f"/{namespace}/camera/pointcloud"
+        self._max_points = max(100, min(50000, int(plugin_config.get("max_points", 10000))))
+        self._min_depth_m = max(0.0, float(plugin_config.get("min_depth_m", 0.25)))
+        self._max_depth_m = max(self._min_depth_m, float(plugin_config.get("max_depth_m", 5.0)))
+        self._intrinsics = None
+        self._frames_received = 0
+        self._frames_sent = 0
+        self._info_subscription = None
+        super().__init__(plugin_config, namespace, executor, client)
+
+    def get_tool(self):
+        return {
+            "name": "camera_pointcloud", "type": "sensor", "multiInstance": False,
+            "description": f"Q5 D455 aligned-depth XYZ point cloud in the color-camera optical frame. Limited to {self._max_points:,} points/frame; this is a forward-facing camera cloud, not 360-degree lidar.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+            }, "required": ["action"], "additionalProperties": False},
+            "topic_out": [{"topic": self._topic, "format": self._format}],
+        }
+
+    def start(self):
+        if self._running:
+            return
+        import numpy as np
+        from sensor_msgs.msg import CameraInfo, Image
+        self._np = np
+        self._running = True
+        if self._subscription is None:
+            self._subscription = self._node.create_subscription(
+                Image, self._source_topic, self._on_depth, _LATEST_QOS)
+        if self._info_subscription is None:
+            self._info_subscription = self._node.create_subscription(
+                CameraInfo, self._info_topic, self._on_info, _RELIABLE_QOS)
+        print(f"[CameraPointCloudPlugin] subscribed {self._source_topic} + {self._info_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
+
+    def _on_info(self, msg):
+        fx, fy, cx, cy = float(msg.k[0]), float(msg.k[4]), float(msg.k[2]), float(msg.k[5])
+        if fx > 0.0 and fy > 0.0:
+            self._intrinsics = (fx, fy, cx, cy)
+
+    def _on_depth(self, msg):
+        if not self._running:
+            return
+        self._frames_received += 1
+        intrinsics = self._intrinsics
+        if (intrinsics is None or msg.encoding not in ("16UC1", "mono16") or
+                time.monotonic() - self._last_sent < 1.0 / self._max_hz):
+            return
+        needed = int(msg.height) * int(msg.step)
+        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
+            return
+        try:
+            dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
+            depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
+            depth = depth[:, :msg.width].astype(self._np.float32) * 0.001
+            stride = max(1, int(((msg.width * msg.height) / self._max_points) ** 0.5 + 0.999))
+            z = depth[::stride, ::stride]
+            valid = (z >= self._min_depth_m) & (z <= self._max_depth_m)
+            if not valid.any():
+                return
+            rows, cols = self._np.indices(z.shape, dtype=self._np.float32)
+            rows *= stride
+            cols *= stride
+            fx, fy, cx, cy = intrinsics
+            points = self._np.stack(
+                ((cols - cx) * z / fx, (rows - cy) * z / fy, z), axis=-1)[valid]
+            if not len(points):
+                return
+            points = self._np.ascontiguousarray(points.astype("<f4", copy=False))
+            payload = struct.pack("<II", 12, len(points)) + points.tobytes()
+            self._send_media({"kind": "pointcloud", "data": payload})
+        except Exception as exc:
+            self._node.get_logger().warn(f"Camera point-cloud encode failed: {exc}")
             return
         self._frames_sent += 1
         self._last_sent = time.monotonic()

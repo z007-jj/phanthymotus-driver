@@ -67,6 +67,14 @@ plugins:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
     max_hz: 15.0
+  camera_pointcloud:
+    enabled: true
+    source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/color/camera_info"
+    max_hz: 5.0
+    max_points: 10000
+    min_depth_m: 0.25
+    max_depth_m: 5.0
   arm_control:
     enabled: true
     hardware_enable: true

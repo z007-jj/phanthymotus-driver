@@ -119,7 +119,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     import rclpy.qos
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
     from sensor_msgs.msg import CompressedImage, Image
     from audio_msgs.msg import AudioChunk
 
@@ -165,6 +165,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
+    pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
@@ -308,6 +309,12 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.step = int(media["step"])
             out.data = media["data"]
             pub_depth.publish(out)
+        elif kind == "pointcloud":
+            # Agent Core's point-cloud renderer consumes this compact binary
+            # envelope: uint32 point_step, uint32 count, float32 xyz * count.
+            out = UInt8MultiArray()
+            out.data = list(media["data"])
+            pub_pointcloud.publish(out)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True
