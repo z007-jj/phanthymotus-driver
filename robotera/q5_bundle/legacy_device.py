@@ -817,12 +817,13 @@ class AudioPlugin:
             "description": "Q5 vendor stored-audio playback, upload-to-path, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", *play_actions, "list_library", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
+                    "start", *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
                     "oneOf": [
                         {"const": "start", "title": "检查音频服务"},
                         *[{"const": action, "title": detail["title"]}
                           for action, detail in play_actions.items()],
                         {"const": "list_library", "title": "查看挂载音频库"},
+                        {"const": "list_robot_audio_files", "title": "查看机器人音频文件"},
                         {"const": "upload_from_library", "title": "从挂载音频库上传"},
                         {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "set_volume", "title": "设置音量"},
@@ -849,6 +850,7 @@ class AudioPlugin:
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
                     "list_library": {"params": [], "description": "列出 /opt/phanthy-motus/data/audios 中可上传的 WAV/MP3 文件。"},
+                    "list_robot_audio_files": {"params": [], "description": "列出 Q5 XOS replay_wav 目录内的文件和可供 play_by_path 使用的完整路径；厂商未提供 ID 映射查询。"},
                     "upload_from_library": {"params": ["file_name"],
                                             "description": "从挂载音频库按文件名上传 WAV/MP3；返回的 path 可传给 play_by_path。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
@@ -876,6 +878,8 @@ class AudioPlugin:
             return self._play(args, play_modes[action])
         if action == "list_library":
             return self._list_library()
+        if action == "list_robot_audio_files":
+            return self._list_robot_audio_files()
         if action == "upload_from_library":
             return self._upload_from_library(args)
         if action == "upload_base64":
@@ -930,6 +934,34 @@ class AudioPlugin:
         except OSError as exc:
             return {"state": "error", "message": f"cannot read audio file: {exc}"}
         return self._upload_payload(file_name, payload)
+
+    def _list_robot_audio_files(self):
+        # The manual documents this replay directory, but exposes no service
+        # for enumerating the XOS audio-library database or its numeric IDs.
+        command = (
+            f"if [ -d {shlex.quote(self._upload_directory)} ]; then "
+            f"find {shlex.quote(self._upload_directory)} -maxdepth 1 -type f "
+            "\\( -iname '*.wav' -o -iname '*.mp3' \\) -printf '%f\\t%s\\n' | sort; "
+            "fi"
+        )
+        try:
+            result = _q5_remote_command(command, timeout=15.0)
+        except Exception as exc:
+            return {"state": "error", "message": f"cannot list Q5 audio files: {exc}"}
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+            return {"state": "error", "message": f"cannot list Q5 audio files: {detail or 'remote command failed'}"}
+        files = []
+        for line in result.stdout.decode(errors="replace").splitlines():
+            name, separator, size = line.partition("\t")
+            if self._valid_upload_name(name):
+                files.append({"file_name": name, "path": f"{self._upload_directory}/{name}",
+                              "bytes": int(size) if separator and size.isdigit() else None})
+        return {
+            "state": "ok", "directory": self._upload_directory, "files": files,
+            "play_action": "play_by_path", "id_mapping_available": False,
+            "note": "The Q5 manual exposes no API to list XOS audio-library IDs; use each returned path with play_by_path.",
+        }
 
     def _upload_base64(self, args):
         file_name = args.get("file_name")
