@@ -48,6 +48,7 @@ plugins:
   audio:
     enabled: true
     device: "plughw:2,0"
+    library_dir: "/opt/phanthy-motus/data/audios"
     upload_max_bytes: 20971520
   camera_rgb:
     enabled: true

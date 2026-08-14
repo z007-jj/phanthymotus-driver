@@ -72,6 +72,7 @@ COPY deploy/ /deploy/
 ENV PYTHONPATH=/work
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
+RUN mkdir -p /opt/phanthy-motus/data/audios
 
 EXPOSE 15793
 

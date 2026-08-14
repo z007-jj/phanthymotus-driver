@@ -801,6 +801,8 @@ class AudioPlugin:
         self._srv_stop = self._node.create_client(Trigger, "/audio_player/stop_play")
         self._srv_is_play = self._node.create_client(Trigger, "/audio_player/is_play")
         self._device = plugin_config.get("device", "plughw:2,0")
+        self._library_dir = os.path.realpath(str(plugin_config.get(
+            "library_dir", "/opt/phanthy-motus/data/audios")))
         self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
 
     def get_tool(self):
@@ -815,11 +817,13 @@ class AudioPlugin:
             "description": "Q5 vendor stored-audio playback, upload-to-path, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", *play_actions, "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
+                    "start", *play_actions, "list_library", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
                     "oneOf": [
                         {"const": "start", "title": "检查音频服务"},
                         *[{"const": action, "title": detail["title"]}
                           for action, detail in play_actions.items()],
+                        {"const": "list_library", "title": "查看挂载音频库"},
+                        {"const": "upload_from_library", "title": "从挂载音频库上传"},
                         {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "set_volume", "title": "设置音量"},
                         {"const": "stop_audio", "title": "停止播放"},
@@ -844,6 +848,9 @@ class AudioPlugin:
                     **{action: {"params": [detail["param"], "force_play", "timeout", "channel", "version"],
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
+                    "list_library": {"params": [], "description": "列出 /opt/phanthy-motus/data/audios 中可上传的 WAV/MP3 文件。"},
+                    "upload_from_library": {"params": ["file_name"],
+                                            "description": "从挂载音频库按文件名上传 WAV/MP3；返回的 path 可传给 play_by_path。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
                                       "description": "上传 WAV/MP3 到机器人 replay_wav 目录；返回的 path 可传给 play_by_path。不会创建 XOS 音频库 ID。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
@@ -867,6 +874,10 @@ class AudioPlugin:
                       "play_by_item": 2, "play_by_file_name": 3}
         if action in play_modes:
             return self._play(args, play_modes[action])
+        if action == "list_library":
+            return self._list_library()
+        if action == "upload_from_library":
+            return self._upload_from_library(args)
         if action == "upload_base64":
             return self._upload_base64(args)
         if action == "set_volume":
@@ -880,12 +891,50 @@ class AudioPlugin:
             return {"state": "idle"}
         return None
 
+    @staticmethod
+    def _valid_upload_name(file_name) -> bool:
+        return (isinstance(file_name, str) and file_name == os.path.basename(file_name) and
+                bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*\.(?:wav|mp3)", file_name, re.IGNORECASE)))
+
+    def _list_library(self):
+        try:
+            entries = []
+            for entry in sorted(os.scandir(self._library_dir), key=lambda item: item.name.lower()):
+                if entry.is_file() and self._valid_upload_name(entry.name):
+                    entries.append({"file_name": entry.name, "bytes": entry.stat().st_size})
+            return {"state": "ok", "library_dir": self._library_dir, "files": entries[:100],
+                    "truncated": len(entries) > 100}
+        except FileNotFoundError:
+            return {"state": "ok", "library_dir": self._library_dir, "files": [],
+                    "message": "audio library directory does not exist yet"}
+        except OSError as exc:
+            return {"state": "error", "message": f"cannot read audio library: {exc}"}
+
+    def _upload_from_library(self, args):
+        file_name = args.get("file_name")
+        if not self._valid_upload_name(file_name):
+            return {"state": "error", "message": "file_name must be a simple .wav or .mp3 filename"}
+        source_path = os.path.realpath(os.path.join(self._library_dir, file_name))
+        if os.path.commonpath((self._library_dir, source_path)) != self._library_dir:
+            return {"state": "error", "message": "file_name is outside the configured audio library"}
+        try:
+            size = os.path.getsize(source_path)
+            if size <= 0:
+                return {"state": "error", "message": "audio file is empty"}
+            if size > self._upload_max_bytes:
+                return {"state": "error", "message": f"audio file exceeds {self._upload_max_bytes} byte upload limit"}
+            with open(source_path, "rb") as source:
+                payload = source.read()
+        except FileNotFoundError:
+            return {"state": "error", "message": f"audio file not found in library: {file_name}"}
+        except OSError as exc:
+            return {"state": "error", "message": f"cannot read audio file: {exc}"}
+        return self._upload_payload(file_name, payload)
+
     def _upload_base64(self, args):
         file_name = args.get("file_name")
         encoded = args.get("content_base64")
-        if not isinstance(file_name, str) or not file_name:
-            return {"state": "error", "message": "file_name is required"}
-        if file_name != os.path.basename(file_name) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*\\.(?:wav|mp3)", file_name, re.IGNORECASE):
+        if not self._valid_upload_name(file_name):
             return {"state": "error", "message": "file_name must be a simple .wav or .mp3 filename"}
         if not isinstance(encoded, str) or not encoded:
             return {"state": "error", "message": "content_base64 is required"}
@@ -893,6 +942,9 @@ class AudioPlugin:
             payload = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
             return {"state": "error", "message": "content_base64 is not valid Base64"}
+        return self._upload_payload(file_name, payload)
+
+    def _upload_payload(self, file_name: str, payload: bytes):
         if not payload:
             return {"state": "error", "message": "audio file is empty"}
         if len(payload) > self._upload_max_bytes:
