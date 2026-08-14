@@ -44,6 +44,7 @@ plugins:
     channels: 1
     output_sample_rate_hz: 48000
     output_channels: 2
+    volume: 100
   audio:
     enabled: true
     device: "plughw:2,0"

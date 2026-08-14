@@ -7,6 +7,7 @@ module contains the verified state, battery, audio, and D455 camera cards.
 from __future__ import annotations
 
 import io
+import audioop
 import re
 import shlex
 import subprocess
@@ -25,7 +26,6 @@ from xbot_common_interfaces.srv import SetVolume
 # consolidated in direct_control.py.
 from legacy_direct_control import (
     ArmControlPlugin,
-    Q5ControlModePlugin,
 )
 
 
@@ -325,7 +325,7 @@ class MicPlugin:
             self.start()
         elif action == "stop":
             self.stop()
-        if action in ("start", "stop", "info"):
+        if action in ("start", "set_volume", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "frames_sent": self._frames_sent}
@@ -344,6 +344,7 @@ class SpeakerPlugin:
         self._channels = int(plugin_config.get("channels", 1))
         self._output_rate = int(plugin_config.get("output_sample_rate_hz", 44100))
         self._output_channels = int(plugin_config.get("output_channels", 2))
+        self._volume = max(0, min(100, int(plugin_config.get("volume", 100))))
         self._process = None
         self._thread = None
         self._running = False
@@ -357,11 +358,18 @@ class SpeakerPlugin:
     def get_tool(self):
         return {
             "name": "speaker", "type": "actuator", "multiInstance": False,
-            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live.",
+            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume applies to this live PCM stream.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+                "action": {"type": "string", "enum": ["start", "set_volume", "stop", "info"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
+                "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100},
             }, "required": ["action"], "additionalProperties": False},
+            "x-action-params": {
+                "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
+                "set_volume": {"params": ["volume"], "description": "设置实时 speaker 的 PCM 振幅，0 静音，100 原始音量。"},
+                "stop": {"params": [], "description": "停止实时播放。"},
+                "info": {"params": [], "description": "查看 speaker 状态。"},
+            },
             # Leave the topic unresolved until canvas supplies input_topic.
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -426,6 +434,12 @@ class SpeakerPlugin:
             elif self._frames_received % 100 == 0:
                 print(f"[SpeakerPlugin] {self._frames_received} PCM frames received from {self._topic}", flush=True)
             try:
+                # This stream bypasses /audio_player, so apply its own
+                # instantaneous, deterministic PCM gain here. A linear
+                # amplitude scale is intentional; perceived loudness is not
+                # physically linear.
+                if self._volume != 100:
+                    chunk = audioop.mul(chunk, 2, self._volume / 100.0)
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()
                 self._frames_written += 1
@@ -460,6 +474,11 @@ class SpeakerPlugin:
                 return {"ok": False, "code": "INPUT_TOPIC_REQUIRED",
                         "message": "Connect an audio/pcm-16k output to speaker before starting playback"}
             self._start_for_topic(requested)
+        elif action == "set_volume":
+            value = args.get("volume")
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                return {"ok": False, "code": "INVALID_VOLUME", "message": "volume must be an integer from 0 to 100"}
+            self._volume = value
         elif action == "stop":
             self.stop()
         if action in ("start", "stop", "info"):
@@ -467,7 +486,7 @@ class SpeakerPlugin:
                     "topic_in": ([{"topic": self._topic, "format": "audio/pcm-16k"}]
                                  if self._topic else [{"format": "audio/pcm-16k"}]),
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
-                                 "channels": self._output_channels},
+                                 "channels": self._output_channels, "volume": self._volume},
                     "frames_received": self._frames_received,
                     "frames_written": self._frames_written}
         return None
