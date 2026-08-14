@@ -202,7 +202,10 @@ pending = bytearray()
 # speaker strategy.  The bridge has shown gaps up to 262 ms, so prefill two
 # blocks before opening the audio gate.  This avoids USB-card underruns caused
 # by scheduling a separate ALSA write for every arbitrary transport fragment.
-input_block_bytes = 9600
+# Keep only one 100 ms transport block queued before opening the ALSA gate.
+# This cuts the old ~600 ms startup delay to about 200 ms while retaining
+# enough buffering for the remote bridge's short scheduling gaps.
+input_block_bytes = 3200
 prefill_bytes = input_block_bytes * 2
 try:
   while True:
@@ -692,7 +695,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 aligned depth preview. Grayscale: near is dark, far is bright.",
+            "description": "Q5 D455 aligned depth preview. Pseudo-color distance: near is red/orange, far is blue; invalid depth is black.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -727,11 +730,25 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. A fixed 0.25-5.0 m window is stable
-            # across frames and avoids the confusing red/green pseudo-colors.
-            preview = self._np.clip((depth - 250.0) * (255.0 / 4750.0), 0, 255).astype(self._np.uint8)
+            # D455 Z16 is millimetres. Map 0.25-5.0 m to an intuitive
+            # near-red -> yellow/green -> far-blue palette; invalid depth is
+            # black. Keep the wire format as JPEG for frontend compatibility.
+            normalized = self._np.clip((depth - 250.0) / 4750.0, 0.0, 1.0)
+            hue = normalized * 0.66
+            h6 = hue * 6.0
+            sector = self._np.floor(h6).astype(self._np.int16)
+            frac = h6 - sector
+            q = (1.0 - frac) * 255.0
+            t = frac * 255.0
+            color = self._np.zeros((depth.shape[0], depth.shape[1], 3), dtype=self._np.uint8)
+            masks = [sector == i for i in range(6)]
+            rgb = [(255, t, 0), (q, 255, 0), (0, 255, t), (0, q, 255), (t, 0, 255), (255, 0, q)]
+            for mask, values in zip(masks, rgb):
+                for channel, value in enumerate(values):
+                    color[..., channel][mask] = self._np.asarray(value, dtype=self._np.uint8)[mask] if hasattr(value, "shape") else value
+            color[depth <= 0] = 0
             encoded = io.BytesIO()
-            self._pil_image.fromarray(preview, "L").save(encoded, format="JPEG", quality=75)
+            self._pil_image.fromarray(color, "RGB").save(encoded, format="JPEG", quality=75)
             self._send_media({"kind": "depth_jpeg", "data": encoded.getvalue()})
         except Exception as exc:
             self._node.get_logger().warn(f"Depth preview encode failed: {exc}")
@@ -842,6 +859,12 @@ class AudioPlugin:
         if unrelated:
             return {"state": "error", "message": (
                 f"mode {mode} only accepts {source_field}; do not provide {', '.join(unrelated)}")}
+        value = args.get(source_field)
+        if mode == 0:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                return {"state": "error", "message": "id must be an integer greater than 0"}
+        elif not isinstance(value, str) or not value.strip():
+            return {"state": "error", "message": f"{source_field} must be a non-empty string"}
         if not self._action_client.wait_for_server(timeout_sec=3.0):
             return {"state": "error", "message": "/audio_player/play is unavailable"}
         goal = AudioPlay.Goal()

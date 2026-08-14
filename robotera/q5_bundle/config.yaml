@@ -76,8 +76,6 @@ plugins:
     # Keep the final arm target published until feedback has caught up.
     settle_tolerance_rad: 0.035
     settle_timeout_s: 1.5
-  q5_control_mode:
-    enabled: true
   hand_control:
     enabled: true
     min_position_rad: 0.0
