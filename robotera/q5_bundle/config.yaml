@@ -48,6 +48,7 @@ plugins:
   audio:
     enabled: true
     device: "plughw:2,0"
+    upload_max_bytes: 20971520
   camera_rgb:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"

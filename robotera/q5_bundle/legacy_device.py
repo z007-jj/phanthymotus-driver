@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import io
 import audioop
+import base64
+import binascii
+import os
 import re
 import shlex
 import subprocess
@@ -787,6 +790,8 @@ def _wait_for_future(future, timeout_sec: float):
 class AudioPlugin:
     """Vendor audio playback via /audio_player/play and paired services."""
 
+    _upload_directory = "/xos/xos/data/audio/replay_wav"
+
     def __init__(self, plugin_config, namespace, executor, client):
         del namespace, client
         self._node = Node("q5_audio")
@@ -796,6 +801,7 @@ class AudioPlugin:
         self._srv_stop = self._node.create_client(Trigger, "/audio_player/stop_play")
         self._srv_is_play = self._node.create_client(Trigger, "/audio_player/is_play")
         self._device = plugin_config.get("device", "plughw:2,0")
+        self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
 
     def get_tool(self):
         play_actions = {
@@ -806,14 +812,15 @@ class AudioPlugin:
         }
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
-            "description": "Q5 vendor audio playback, volume, stop, and status.",
+            "description": "Q5 vendor stored-audio playback, upload-to-path, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", *play_actions, "set_volume", "stop_audio", "is_play", "stop", "info"],
+                    "start", *play_actions, "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
                     "oneOf": [
                         {"const": "start", "title": "检查音频服务"},
                         *[{"const": action, "title": detail["title"]}
                           for action, detail in play_actions.items()],
+                        {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "set_volume", "title": "设置音量"},
                         {"const": "stop_audio", "title": "停止播放"},
                         {"const": "is_play", "title": "查询播放状态"},
@@ -824,6 +831,7 @@ class AudioPlugin:
                 "path": {"type": "string", "title": "设备音频路径", "minLength": 1},
                 "item": {"type": "string", "title": "item JSON", "minLength": 1},
                 "file_name": {"type": "string", "title": "音频文件名", "minLength": 1},
+                "content_base64": {"type": "string", "title": "WAV/MP3 文件内容 (Base64)", "minLength": 1},
                 "force_play": {"type": "boolean", "title": "强制打断当前播放"},
                 "timeout": {"type": "integer", "title": "超时 (s)", "minimum": 0},
                 "channel": {"type": "string", "title": "播放通道",
@@ -836,7 +844,9 @@ class AudioPlugin:
                     **{action: {"params": [detail["param"], "force_play", "timeout", "channel", "version"],
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
-                    "set_volume": {"params": ["volume"], "description": "设置 0 到 100 的播放音量。"},
+                    "upload_base64": {"params": ["file_name", "content_base64"],
+                                      "description": "上传 WAV/MP3 到机器人 replay_wav 目录；返回的 path 可传给 play_by_path。不会创建 XOS 音频库 ID。"},
+                    "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
                     "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
                     "is_play": {"params": [], "description": "查询当前是否正在播放。"},
                     "stop": {"params": [], "description": "停止音频卡并停止当前播放。"},
@@ -857,6 +867,8 @@ class AudioPlugin:
                       "play_by_item": 2, "play_by_file_name": 3}
         if action in play_modes:
             return self._play(args, play_modes[action])
+        if action == "upload_base64":
+            return self._upload_base64(args)
         if action == "set_volume":
             return self._set_volume(args.get("volume", 50))
         if action == "stop_audio":
@@ -867,6 +879,43 @@ class AudioPlugin:
             self._stop_audio()
             return {"state": "idle"}
         return None
+
+    def _upload_base64(self, args):
+        file_name = args.get("file_name")
+        encoded = args.get("content_base64")
+        if not isinstance(file_name, str) or not file_name:
+            return {"state": "error", "message": "file_name is required"}
+        if file_name != os.path.basename(file_name) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*\\.(?:wav|mp3)", file_name, re.IGNORECASE):
+            return {"state": "error", "message": "file_name must be a simple .wav or .mp3 filename"}
+        if not isinstance(encoded, str) or not encoded:
+            return {"state": "error", "message": "content_base64 is required"}
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return {"state": "error", "message": "content_base64 is not valid Base64"}
+        if not payload:
+            return {"state": "error", "message": "audio file is empty"}
+        if len(payload) > self._upload_max_bytes:
+            return {"state": "error", "message": f"audio file exceeds {self._upload_max_bytes} byte upload limit"}
+        remote_path = f"{self._upload_directory}/{file_name}"
+        temporary_path = f"{remote_path}.part"
+        command = (
+            f"mkdir -p {shlex.quote(self._upload_directory)} && "
+            f"base64 -d > {shlex.quote(temporary_path)} && "
+            f"mv {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
+        )
+        try:
+            result = _q5_remote_command(command, timeout=45.0, stdin=base64.b64encode(payload))
+        except Exception as exc:
+            return {"state": "error", "message": f"audio upload failed: {exc}"}
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+            return {"state": "error", "message": f"audio upload failed: {detail or 'remote command failed'}"}
+        return {
+            "state": "ok", "file_name": file_name, "path": remote_path,
+            "bytes_uploaded": len(payload), "next_action": "play_by_path",
+            "note": "File is copied to the replay path; this does not create an XOS audio-library id.",
+        }
 
     def _play(self, args, mode: int):
         source_fields = {0: "id", 1: "path", 2: "item", 3: "file_name"}
