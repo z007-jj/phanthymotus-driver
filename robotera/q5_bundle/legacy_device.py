@@ -398,12 +398,14 @@ class SpeakerPlugin:
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
-        # Stop the vendor player when possible, but never let a temporarily
-        # unavailable ROS service prevent the independent ALSA stream from
-        # starting. The developer-container service discovery can block here.
+        # XOS owns the hardware mixer while its player is active.  This call
+        # runs on the developer container, which is on the robot's ROS domain
+        # and uses Cyclone DDS; inheriting the bridge's Domain 42/Fast DDS
+        # environment made the call target no valid context.
         try:
             stopped = _q5_remote_command(
                 "source /opt/ros/humble/setup.bash; "
+                "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
                 "timeout 2 ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
                 timeout=4.0)
             if stopped.returncode:
@@ -754,13 +756,12 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. Use a restrained perceptual palette:
-            # near is warm gold, middle distances move through rose/violet,
-            # and far is deep indigo. Invalid pixels remain black.
+            # D455 Z16 is millimetres. Keep the full distance range readable
+            # with a light, low-saturation palette; invalid pixels stay black.
             normalized = self._np.clip((depth - 250.0) / 4750.0, 0.0, 1.0)
             stops = self._np.array([
-                (255, 230, 170), (253, 148, 95), (208, 70, 110),
-                (93, 38, 110), (18, 22, 50),
+                (255, 246, 220), (255, 214, 190), (230, 202, 238),
+                (191, 215, 245), (129, 170, 220),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)
@@ -793,6 +794,8 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
         self._max_points = max(100, min(50000, int(plugin_config.get("max_points", 10000))))
         self._min_depth_m = max(0.0, float(plugin_config.get("min_depth_m", 0.25)))
         self._max_depth_m = max(self._min_depth_m, float(plugin_config.get("max_depth_m", 5.0)))
+        self._camera_mount_pitch_rad = float(plugin_config.get("camera_mount_pitch_rad", 0.14655))
+        self._floor_offset_m = max(0.0, float(plugin_config.get("floor_offset_m", 1.15)))
         self._intrinsics = None
         self._frames_received = 0
         self._frames_sent = 0
@@ -855,10 +858,21 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
             fx, fy, cx, cy = intrinsics
             camera_x = (cols - cx) * z / fx  # right
             camera_y = (rows - cy) * z / fy  # down
+            # The depth image is in the D455 optical frame.  Render it in a
+            # Q5 body-level frame instead: account for the fixed D455 mount
+            # angle and the current neck pitch, then put the camera origin at
+            # its configured height over the floor.
+            joints = self._client.snapshot().get("joints") or {}
+            neck_pitch = float(joints.get("neck_pitch_joint", 0.0))
+            pitch = self._camera_mount_pitch_rad + neck_pitch
+            cosine, sine = self._np.cos(pitch), self._np.sin(pitch)
+            camera_up = -camera_y
+            body_up = cosine * camera_up - sine * z + self._floor_offset_m
+            body_forward = sine * camera_up + cosine * z
             # Agent Core's point-cloud renderer maps packet (x, y, z) to
-            # display (y, -z, -x). Pack the camera optical frame as
-            # (-forward, right, down), producing display (right, up, forward).
-            points = self._np.stack((-z, camera_x, camera_y), axis=-1)[valid]
+            # display (y, -z, -x). Pack Q5 body coordinates as
+            # (-forward, right, -up), producing display (right, up, forward).
+            points = self._np.stack((-body_forward, camera_x, -body_up), axis=-1)[valid]
             if not len(points):
                 return
             points = self._np.ascontiguousarray(points.astype("<f4", copy=False))

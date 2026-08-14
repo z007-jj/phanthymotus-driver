@@ -42,7 +42,8 @@ plugins:
     device: "hw:2,0"
     sample_rate_hz: 16000
     channels: 1
-    output_sample_rate_hz: 48000
+    # The verified Q5 amplifier route is S16_LE stereo at 44.1 kHz.
+    output_sample_rate_hz: 44100
     output_channels: 2
     volume: 100
   audio:
@@ -75,6 +76,10 @@ plugins:
     max_points: 10000
     min_depth_m: 0.25
     max_depth_m: 5.0
+    # Q5 head-camera mounting calibration.  `floor_offset_m` is deliberately
+    # configurable because the actual camera height varies with neck pose.
+    camera_mount_pitch_rad: 0.14655
+    floor_offset_m: 1.15
   arm_control:
     enabled: true
     hardware_enable: true
