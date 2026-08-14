@@ -817,9 +817,8 @@ class AudioPlugin:
             "description": "Q5 vendor stored-audio playback, upload-to-path, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop", "info"],
+                    *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
-                        {"const": "start", "title": "检查音频服务"},
                         *[{"const": action, "title": detail["title"]}
                           for action, detail in play_actions.items()],
                         {"const": "list_library", "title": "查看挂载音频库"},
@@ -830,7 +829,6 @@ class AudioPlugin:
                         {"const": "stop_audio", "title": "停止播放"},
                         {"const": "is_play", "title": "查询播放状态"},
                         {"const": "stop", "title": "停止音频卡"},
-                        {"const": "info", "title": "查看状态"},
                     ]},
                 "id": {"type": "integer", "title": "内置音频 ID"},
                 "path": {"type": "string", "title": "设备音频路径", "minLength": 1},
@@ -845,7 +843,6 @@ class AudioPlugin:
                 "volume": {"type": "integer", "title": "音量", "minimum": 0, "maximum": 100},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
-                    "start": {"params": [], "description": "检查 Q5 厂商音频服务。"},
                     **{action: {"params": [detail["param"], "force_play", "timeout", "channel", "version"],
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
@@ -859,7 +856,6 @@ class AudioPlugin:
                     "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
                     "is_play": {"params": [], "description": "查询当前是否正在播放。"},
                     "stop": {"params": [], "description": "停止音频卡并停止当前播放。"},
-                    "info": {"params": [], "description": "查看音频服务状态。"},
                 }},
         }
 
