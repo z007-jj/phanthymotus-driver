@@ -64,6 +64,20 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
 
 _Q5_MIC_PIDFILE = "/tmp/phanthymotus-q5-mic-capture.pid"
 _Q5_SPEAKER_PIDFILE = "/tmp/phanthymotus-q5-speaker-playback.pid"
+_Q5_DEVELOPER_SUDO_PASSWORD = "developer"
+
+
+def _q5_root_command(command: str) -> str:
+    """Run one noninteractive root command in Q5's developer container.
+
+    XOS owns its replay directory as root. Audio bytes are always staged in a
+    developer-writable temporary file before this helper is called, so the
+    sudo password stream can never be mistaken for audio payload.
+    """
+    return (
+        f"printf '%s\\n' {shlex.quote(_Q5_DEVELOPER_SUDO_PASSWORD)} | "
+        f"sudo -S -p '' bash -c {shlex.quote(command)}"
+    )
 
 
 def _stop_remote_mic_capture() -> None:
@@ -1129,7 +1143,7 @@ class AudioPlugin:
     def _list_robot_audio_files(self):
         # The manual documents this replay directory, but exposes no service
         # for enumerating the XOS audio-library database or its numeric IDs.
-        command = (
+        command = _q5_root_command(
             f"if [ -d {shlex.quote(self._upload_directory)} ]; then "
             f"find {shlex.quote(self._upload_directory)} -maxdepth 1 -type f "
             "\\( -iname '*.wav' -o -iname '*.mp3' \\) -printf '%f\\t%s\\n' | sort; "
@@ -1174,10 +1188,20 @@ class AudioPlugin:
             return {"state": "error", "message": f"audio file exceeds {self._upload_max_bytes} byte upload limit"}
         remote_path = f"{self._upload_directory}/{file_name}"
         temporary_path = f"{remote_path}.part"
+        # Receive the bytes where developer has write access. Then use one
+        # privileged, atomic install/move for the root-owned XOS directory.
+        staging_template = "/tmp/phanthymotus-q5-audio.XXXXXX"
+        root_install = (
+            f"install -D -m 0644 {{staging}} {shlex.quote(temporary_path)} && "
+            f"mv -f {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
+        )
         command = (
-            f"mkdir -p {shlex.quote(self._upload_directory)} && "
-            f"base64 -d > {shlex.quote(temporary_path)} && "
-            f"mv {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
+            "set -e; "
+            f"staging=$(mktemp {shlex.quote(staging_template)}); "
+            "export staging; "
+            "trap 'rm -f \"$staging\"' EXIT; "
+            "base64 -d > \"$staging\"; "
+            + _q5_root_command(root_install.format(staging='"$staging"'))
         )
         try:
             result = _q5_remote_command(command, timeout=45.0, stdin=base64.b64encode(payload))
