@@ -73,6 +73,7 @@ plugins:
     near_depth_m: 0.25
     far_depth_m: 4.0
     gamma: 0.70
+    jpeg_quality: 88
   camera_pointcloud:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"

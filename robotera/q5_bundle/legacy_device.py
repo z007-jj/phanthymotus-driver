@@ -812,6 +812,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         self._far_depth_mm = max(self._near_depth_mm + 1.0,
                                  float(plugin_config.get("far_depth_m", 4.0)) * 1000.0)
         self._depth_gamma = max(0.25, min(2.0, float(plugin_config.get("gamma", 0.70))))
+        self._jpeg_quality = max(60, min(95, int(plugin_config.get("jpeg_quality", 88))))
         self._frames_received = 0
         self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
@@ -819,7 +820,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 aligned depth preview. Fixed-scale pseudo-color distance: near is yellow, far is violet; invalid depth is black.",
+            "description": "Q5 D455 aligned depth preview. Fixed-scale Cividis distance colors: near is warm, far is deep blue; invalid depth is black.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -861,10 +862,11 @@ class CameraDepthPlugin(_Q5MediaPlugin):
                 (depth - self._near_depth_mm) / (self._far_depth_mm - self._near_depth_mm), 0.0, 1.0)
             normalized = normalized ** self._depth_gamma
             stops = self._np.array([
-                # Reversed Viridis: close is warm/high-visibility and far
-                # recedes through teal into violet without rainbow banding.
-                (253, 231, 37), (94, 201, 98), (33, 145, 140),
-                (59, 82, 139), (68, 1, 84),
+                # Reversed Cividis is intentionally restrained: it preserves
+                # distance ordering without the rainbow bands and purple cast
+                # of a decorative pseudo-color map.
+                (255, 233, 69), (187, 185, 91), (110, 146, 102),
+                (55, 108, 111), (0, 43, 78),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)
@@ -873,7 +875,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             color = ((1.0 - fraction) * stops[lower] + fraction * stops[upper]).astype(self._np.uint8)
             color[depth <= 0] = 0
             encoded = io.BytesIO()
-            self._pil_image.fromarray(color, "RGB").save(encoded, format="JPEG", quality=75)
+            # Depth color edges are especially sensitive to JPEG chroma
+            # subsampling, so keep full chroma resolution for a clean preview.
+            self._pil_image.fromarray(color, "RGB").save(
+                encoded, format="JPEG", quality=self._jpeg_quality, subsampling=0)
             self._send_media({"kind": "depth_jpeg", "data": encoded.getvalue()})
         except Exception as exc:
             self._node.get_logger().warn(f"Depth preview encode failed: {exc}")
