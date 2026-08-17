@@ -740,6 +740,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         # exposes a separate JPEG preview topic so Agent Core never sees two
         # incompatible message types on one DDS path.
         self._topic = f"/{namespace}/camera/depth_preview"
+        self._near_depth_mm = max(1.0, float(plugin_config.get("near_depth_m", 0.25)) * 1000.0)
+        self._far_depth_mm = max(self._near_depth_mm + 1.0,
+                                 float(plugin_config.get("far_depth_m", 4.0)) * 1000.0)
+        self._depth_gamma = max(0.25, min(2.0, float(plugin_config.get("gamma", 0.70))))
         self._frames_received = 0
         self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
@@ -747,7 +751,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 aligned depth preview. Pseudo-color distance: near is red/orange, far is blue; invalid depth is black.",
+            "description": "Q5 D455 aligned depth preview. Fixed-scale pseudo-color distance: near is yellow, far is violet; invalid depth is black.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -782,12 +786,17 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. Render distance on a single polished
-            # ivory-to-teal scale; invalid pixels stay black.
-            normalized = self._np.clip((depth - 250.0) / 4750.0, 0.0, 1.0)
+            # D455 Z16 is millimetres. Use a fixed range to keep distance
+            # colors stable between frames, then apply a modest gamma so the
+            # near/mid-field geometry remains legible indoors.
+            normalized = self._np.clip(
+                (depth - self._near_depth_mm) / (self._far_depth_mm - self._near_depth_mm), 0.0, 1.0)
+            normalized = normalized ** self._depth_gamma
             stops = self._np.array([
-                (255, 251, 238), (222, 239, 238), (158, 207, 201),
-                (87, 160, 167), (37, 104, 130),
+                # Reversed Viridis: close is warm/high-visibility and far
+                # recedes through teal into violet without rainbow banding.
+                (253, 231, 37), (94, 201, 98), (33, 145, 140),
+                (59, 82, 139), (68, 1, 84),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)
