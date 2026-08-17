@@ -63,6 +63,7 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
 
 
 _Q5_MIC_PIDFILE = "/tmp/phanthymotus-q5-mic-capture.pid"
+_Q5_SPEAKER_PIDFILE = "/tmp/phanthymotus-q5-speaker-playback.pid"
 
 
 def _stop_remote_mic_capture() -> None:
@@ -86,6 +87,53 @@ def _q5_mic_capture_shell(command: str) -> str:
     return f"""pidfile={shlex.quote(_Q5_MIC_PIDFILE)}
 echo $$ > \"$pidfile\"
 exec -a q5_mic_capture python3 -u -c {shlex.quote(command)}"""
+
+
+def _stop_remote_speaker_playback() -> None:
+    """Stop only a tagged direct-ALSA speaker left by this driver."""
+    command = f"""pidfile={shlex.quote(_Q5_SPEAKER_PIDFILE)}
+if test -r \"$pidfile\"; then
+  pid=$(cat \"$pidfile\" 2>/dev/null || true)
+  if test -n \"$pid\" && test -r \"/proc/$pid/cmdline\" && grep -aq q5_speaker_playback \"/proc/$pid/cmdline\"; then
+    kill \"$pid\" 2>/dev/null || true
+  fi
+  rm -f \"$pidfile\"
+fi"""
+    try:
+        _q5_remote_command(command, timeout=5.0)
+    except Exception:
+        pass
+
+
+def _q5_speaker_playback_shell(command: str) -> str:
+    """Tag the remote process so restarts cannot leave ALSA playback busy."""
+    return f"""pidfile={shlex.quote(_Q5_SPEAKER_PIDFILE)}
+echo $$ > \"$pidfile\"
+exec -a q5_speaker_playback python3 -u -c {shlex.quote(command)}"""
+
+
+def _q5_remote_playback_holders() -> str:
+    """Return processes with an open Q5 playback PCM device for diagnostics."""
+    probe = r"""from pathlib import Path
+target = '/dev/snd/pcmC2D0p'
+holders = []
+for process in Path('/proc').glob('[0-9]*'):
+    try:
+        for fd in (process / 'fd').iterdir():
+            if fd.resolve() == Path(target):
+                cmdline = (process / 'cmdline').read_bytes().replace(b'\\0', b' ').decode(errors='replace').strip()
+                holders.append('%s:%s' % (process.name, cmdline or '[no cmdline]'))
+                break
+    except OSError:
+        continue
+print('; '.join(holders) or 'none')"""
+    try:
+        result = _q5_remote_command("python3 -c " + shlex.quote(probe), timeout=5.0)
+        if not result.returncode:
+            return result.stdout.decode(errors="replace").strip() or "none"
+    except Exception:
+        pass
+    return "unavailable"
 
 
 def _raise_if_remote_process_exited(process, label: str) -> None:
@@ -415,12 +463,17 @@ class SpeakerPlugin:
                 print(f"[SpeakerPlugin] vendor player was not stopped: {detail}", flush=True)
         except Exception as exc:
             print(f"[SpeakerPlugin] vendor player stop timed out; continuing with ALSA: {exc}", flush=True)
+        _stop_remote_speaker_playback()
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
         self._process = subprocess.Popen(
-            _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
+            _q5_ssh_args(_q5_speaker_playback_shell(command)), stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
-        _raise_if_remote_process_exited(self._process, "speaker")
+        try:
+            _raise_if_remote_process_exited(self._process, "speaker")
+        except RuntimeError as exc:
+            holders = _q5_remote_playback_holders()
+            raise RuntimeError(f"{exc}; playback device holders: {holders}") from exc
         configure = getattr(self._client, "configure_speaker", None)
         if callable(configure):
             configure(self._topic)
@@ -496,6 +549,7 @@ class SpeakerPlugin:
             except (subprocess.TimeoutExpired, OSError):
                 self._process.terminate()
             self._process = None
+        _stop_remote_speaker_playback()
 
     def dispatch(self, action, args):
         if action == "start":
