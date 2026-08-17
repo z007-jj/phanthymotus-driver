@@ -336,7 +336,7 @@ class SpeakerPlugin:
     """Play any canvas-connected PCM AudioChunk stream on Q5 ALSA output."""
 
     def __init__(self, plugin_config, namespace, executor, client):
-        del namespace, executor
+        del namespace
         self._client = client
         self._topic = ""
         self._device = str(plugin_config.get("device", "hw:2,0"))
@@ -345,6 +345,11 @@ class SpeakerPlugin:
         self._output_rate = int(plugin_config.get("output_sample_rate_hz", 44100))
         self._output_channels = int(plugin_config.get("output_channels", 2))
         self._volume = max(0, min(100, int(plugin_config.get("volume", 100))))
+        self._input_gain = max(1.0, min(4.0, float(plugin_config.get("input_gain", 3.0))))
+        self._system_volume = None
+        self._node = Node("q5_speaker")
+        executor.add_node(self._node)
+        self._srv_volume = self._node.create_client(SetVolume, "/audio_player/set_volume")
         self._process = None
         self._thread = None
         self._running = False
@@ -358,7 +363,7 @@ class SpeakerPlugin:
     def get_tool(self):
         return {
             "name": "speaker", "type": "actuator", "multiInstance": False,
-            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume applies to this live PCM stream.",
+            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume controls the Q5 system volume and the live PCM stream.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "set_volume", "stop", "info"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
@@ -367,7 +372,7 @@ class SpeakerPlugin:
             }, "required": ["action"], "additionalProperties": False},
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
-                "set_volume": {"params": ["volume"], "description": "设置实时 speaker 的 PCM 振幅，0 静音，100 原始音量。"},
+                "set_volume": {"params": ["volume"], "description": "设置 Q5 系统音量和实时 speaker 音量，0 静音，100 最大。"},
                 "stop": {"params": [], "description": "停止实时播放。"},
                 "info": {"params": [], "description": "查看 speaker 状态。"},
             },
@@ -394,6 +399,7 @@ class SpeakerPlugin:
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
+        self._set_system_volume(self._volume)
         # XOS owns the hardware mixer while its player is active.  This call
         # runs on the developer container, which is on the robot's ROS domain
         # and uses Cyclone DDS; inheriting the bridge's Domain 42/Fast DDS
@@ -437,12 +443,12 @@ class SpeakerPlugin:
             elif self._frames_received % 100 == 0:
                 print(f"[SpeakerPlugin] {self._frames_received} PCM frames received from {self._topic}", flush=True)
             try:
-                # This stream bypasses /audio_player, so apply its own
-                # instantaneous, deterministic PCM gain here. A linear
-                # amplitude scale is intentional; perceived loudness is not
-                # physically linear.
-                if self._volume != 100:
-                    chunk = audioop.mul(chunk, 2, self._volume / 100.0)
+                # The input stream is commonly quieter than Q5 stored audio.
+                # Keep the user-facing 0-100 control linear, then apply a
+                # bounded source-gain calibration. audioop clips PCM safely.
+                gain = (self._volume / 100.0) * self._input_gain
+                if gain != 1.0:
+                    chunk = audioop.mul(chunk, 2, gain)
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()
                 self._frames_written += 1
@@ -458,6 +464,27 @@ class SpeakerPlugin:
                 print(f"[SpeakerPlugin] remote playback stream ended: {detail}", flush=True)
                 self._running = False
                 break
+
+    def _set_system_volume(self, volume: int) -> None:
+        """Set XOS's global audio route volume without starting its player."""
+        if not self._srv_volume.wait_for_service(timeout_sec=2.0):
+            self._system_volume = {"state": "unavailable", "volume": volume}
+            print("[SpeakerPlugin] XOS volume service is unavailable", flush=True)
+            return
+        request = SetVolume.Request()
+        request.volume = volume
+        response = _wait_for_future(self._srv_volume.call_async(request), 2.0)
+        if response is None:
+            self._system_volume = {"state": "timeout", "volume": volume}
+            print("[SpeakerPlugin] XOS volume request timed out", flush=True)
+            return
+        self._system_volume = {
+            "state": "ok" if response.success else "error",
+            "volume": volume,
+            "message": response.message,
+        }
+        if not response.success:
+            print(f"[SpeakerPlugin] XOS volume was not set: {response.message}", flush=True)
 
     def stop(self):
         self._running = False
@@ -482,6 +509,7 @@ class SpeakerPlugin:
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
                 return {"ok": False, "code": "INVALID_VOLUME", "message": "volume must be an integer from 0 to 100"}
             self._volume = value
+            self._set_system_volume(value)
         elif action == "stop":
             self.stop()
         if action in ("start", "set_volume", "stop", "info"):
@@ -489,7 +517,9 @@ class SpeakerPlugin:
                     "topic_in": ([{"topic": self._topic, "format": "audio/pcm-16k"}]
                                  if self._topic else [{"format": "audio/pcm-16k"}]),
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
-                                 "channels": self._output_channels, "volume": self._volume},
+                                 "channels": self._output_channels, "volume": self._volume,
+                                 "input_gain": self._input_gain,
+                                 "system_volume": self._system_volume},
                     "frames_received": self._frames_received,
                     "frames_written": self._frames_written}
         return None
