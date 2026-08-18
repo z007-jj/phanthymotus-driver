@@ -1036,6 +1036,9 @@ class AudioPlugin:
     _xos_audio_upload_path = "/robot/replay/tts/upload_audio?lang=zh"
     _xos_audio_check_path = "/robot/replay/tts/check_audio_exist?lang=zh"
     _xos_audio_delete_path = "/robot/replay/tts/delete?lang=zh"
+    _xos_chat_launch_path = "/robot/chat/launch_chat?lang=zh"
+    _xos_chat_state_path = "/robot/chat/get_chat_launch_state?lang=zh"
+    _xos_chat_quit_path = "/robot/chat/quit_chat?lang=zh"
 
     def __init__(self, plugin_config, namespace, executor, client):
         del namespace, client
@@ -1050,6 +1053,10 @@ class AudioPlugin:
             "library_dir", "/opt/phanthy-motus/data/audios")))
         self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
         self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
+        # XOS chat owns the vendor audio route. Serialize play/launch/quit so
+        # two MCP calls cannot tear down one another's playback session.
+        self._chat_lock = threading.RLock()
+        self._chat_poll_timeout = max(1.0, float(plugin_config.get("chat_poll_timeout_s", 8.0)))
 
     def get_tool(self):
         play_actions = {
@@ -1275,7 +1282,61 @@ class AudioPlugin:
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             return {"code": 0, "msg": f"XOS audio API unavailable: {exc}"}
 
+    def _xos_chat_is_on(self):
+        response = self._xos_json_request(self._xos_chat_state_path, method="POST", payload={})
+        if response.get("code") != 200:
+            return None, response.get("msg", "XOS chat state unavailable")
+        return str(response.get("data", "")).upper() == "ON", None
+
+    def _xos_chat_set(self, path):
+        response = self._xos_json_request(path, method="POST", payload={})
+        if response.get("code") != 200:
+            return False, response.get("msg", "XOS chat request failed")
+        return True, None
+
+    def _xos_chat_wait(self, wanted_on):
+        deadline = time.monotonic() + self._chat_poll_timeout
+        last_error = None
+        while time.monotonic() < deadline:
+            state, error = self._xos_chat_is_on()
+            if error:
+                last_error = error
+            elif state is wanted_on:
+                return True, None
+            time.sleep(0.2)
+        return False, last_error or ("XOS chat did not reach " + ("ON" if wanted_on else "OFF"))
+
+    def _xos_chat_start_for_playback(self):
+        """Return whether this call started chat, preserving pre-existing chat."""
+        state, error = self._xos_chat_is_on()
+        if error:
+            return None, error
+        if state:
+            return False, None
+        ok, error = self._xos_chat_set(self._xos_chat_launch_path)
+        if not ok:
+            return None, error
+        ok, error = self._xos_chat_wait(True)
+        if not ok:
+            # launch_chat may have succeeded even when the state endpoint is
+            # slow to converge; do not leave XOS chat occupying the speaker.
+            self._xos_chat_stop_after_playback()
+            return None, error
+        return True, None
+
+    def _xos_chat_stop_after_playback(self):
+        ok, error = self._xos_chat_set(self._xos_chat_quit_path)
+        if not ok:
+            return False, error
+        return self._xos_chat_wait(False)
+
     def _play(self, args, mode: int):
+        # XOS refuses vendor playback while its chat session is stopped. Keep
+        # the session scoped to this request, unless the user had it enabled.
+        with self._chat_lock:
+            return self._play_with_chat(args, mode)
+
+    def _play_with_chat(self, args, mode: int):
         source_fields = {0: "id", 1: "path", 2: "item", 3: "file_name"}
         source_field = source_fields[mode]
         if source_field not in args:
@@ -1308,33 +1369,40 @@ class AudioPlugin:
                 return {"state": "error", "message": "id must be an integer greater than 0"}
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
-        if not self._action_client.wait_for_server(timeout_sec=3.0):
-            return {"state": "error", "message": "/audio_player/play is unavailable"}
-        goal = AudioPlay.Goal()
-        goal.mode = mode
-        # XOS reports a successful action even when another playback session
-        # owns the route. Make an explicit audio-card request preempt that
-        # session unless the caller opts out.
-        goal.force_play = bool(args.get("force_play", True))
-        # Send precisely one source field. Besides making the action contract
-        # unambiguous, this shields XOS from controls retained by a previous
-        # card-mode selection.
-        goal.id = int(value) if mode == 0 else 0
-        goal.path = str(value) if mode == 1 else ""
-        goal.item = str(value) if mode == 2 else ""
-        goal.file_name = str(value) if mode == 3 else ""
-        goal.channel = str(args.get("channel", "default"))
-        goal.timeout = int(args.get("timeout", 0))
-        goal.version = str(args.get("version", "v1"))
-        goal_handle = _wait_for_future(self._action_client.send_goal_async(goal), 5.0)
-        if goal_handle is None:
-            return {"state": "error", "message": "audio goal timed out"}
-        if not goal_handle.accepted:
-            return {"state": "error", "message": "audio goal rejected"}
-        response = _wait_for_future(goal_handle.get_result_async(), max(10.0, goal.timeout + 2.0))
-        if response is None:
-            return {"state": "error", "message": "audio result timed out"}
-        return {"state": "ok" if response.result.success else "error", "message": response.result.message}
+        started_chat, chat_error = self._xos_chat_start_for_playback()
+        if started_chat is None:
+            return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
+        try:
+            if not self._action_client.wait_for_server(timeout_sec=3.0):
+                return {"state": "error", "message": "/audio_player/play is unavailable"}
+            goal = AudioPlay.Goal()
+            goal.mode = mode
+            # XOS reports a successful action even when another playback session
+            # owns the route. Make an explicit audio-card request preempt that
+            # session unless the caller opts out.
+            goal.force_play = bool(args.get("force_play", True))
+            # Send precisely one source field. Besides making the action contract
+            # unambiguous, this shields XOS from controls retained by a previous
+            # card-mode selection.
+            goal.id = int(value) if mode == 0 else 0
+            goal.path = str(value) if mode == 1 else ""
+            goal.item = str(value) if mode == 2 else ""
+            goal.file_name = str(value) if mode == 3 else ""
+            goal.channel = str(args.get("channel", "default"))
+            goal.timeout = int(args.get("timeout", 0))
+            goal.version = str(args.get("version", "v1"))
+            goal_handle = _wait_for_future(self._action_client.send_goal_async(goal), 5.0)
+            if goal_handle is None:
+                return {"state": "error", "message": "audio goal timed out"}
+            if not goal_handle.accepted:
+                return {"state": "error", "message": "audio goal rejected"}
+            response = _wait_for_future(goal_handle.get_result_async(), max(10.0, goal.timeout + 2.0))
+            if response is None:
+                return {"state": "error", "message": "audio result timed out"}
+            return {"state": "ok" if response.result.success else "error", "message": response.result.message}
+        finally:
+            if started_chat:
+                self._xos_chat_stop_after_playback()
 
     def _set_volume(self, value):
         if not self._srv_volume.service_is_ready():
