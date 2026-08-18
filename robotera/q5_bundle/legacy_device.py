@@ -813,6 +813,8 @@ class CameraDepthPlugin(_Q5MediaPlugin):
                                  float(plugin_config.get("far_depth_m", 4.0)) * 1000.0)
         self._depth_gamma = max(0.25, min(2.0, float(plugin_config.get("gamma", 0.70))))
         self._jpeg_quality = max(60, min(95, int(plugin_config.get("jpeg_quality", 88))))
+        self._auto_contrast = bool(plugin_config.get("auto_contrast", True))
+        self._display_range_mm = None
         self._frames_received = 0
         self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
@@ -820,7 +822,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 aligned depth preview. Fixed-scale Cividis distance colors: near is warm, far is deep blue; invalid depth is black.",
+            "description": "Q5 D455 aligned depth preview. Adaptive ice-blue distance colors: near is bright, far is deep blue; invalid depth is black.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -855,18 +857,34 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
             depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
             depth = depth[:, :msg.width].astype(self._np.float32)
-            # D455 Z16 is millimetres. Use a fixed range to keep distance
-            # colors stable between frames, then apply a modest gamma so the
-            # near/mid-field geometry remains legible indoors.
+            # D455 Z16 is millimetres. Adapt the display range to the visible
+            # scene so ordinary indoor geometry does not collapse into one
+            # muddy color. Smooth the percentile range across frames to avoid
+            # visual flicker while preserving configured physical bounds.
+            low, high = self._near_depth_mm, self._far_depth_mm
+            valid_depth = depth[depth > 0]
+            if self._auto_contrast and valid_depth.size >= 32:
+                target_low = float(self._np.clip(self._np.percentile(valid_depth, 2), low, high))
+                target_high = float(self._np.clip(self._np.percentile(valid_depth, 98), low, high))
+                if target_high - target_low >= 100.0:
+                    if self._display_range_mm is None:
+                        self._display_range_mm = (target_low, target_high)
+                    else:
+                        previous_low, previous_high = self._display_range_mm
+                        self._display_range_mm = (
+                            previous_low * 0.80 + target_low * 0.20,
+                            previous_high * 0.80 + target_high * 0.20,
+                        )
+                    low, high = self._display_range_mm
             normalized = self._np.clip(
-                (depth - self._near_depth_mm) / (self._far_depth_mm - self._near_depth_mm), 0.0, 1.0)
+                (depth - low) / (high - low), 0.0, 1.0)
             normalized = normalized ** self._depth_gamma
             stops = self._np.array([
-                # Reversed Cividis is intentionally restrained: it preserves
-                # distance ordering without the rainbow bands and purple cast
-                # of a decorative pseudo-color map.
-                (255, 233, 69), (187, 185, 91), (110, 146, 102),
-                (55, 108, 111), (0, 43, 78),
+                # A single cold-depth scale reads like a depth instrument,
+                # not a decorative pseudo-color image: close is ice-white,
+                # then cyan, then deep blue in the distance.
+                (246, 251, 250), (169, 215, 222), (89, 164, 181),
+                (40, 95, 132), (13, 32, 61),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)

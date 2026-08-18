@@ -74,6 +74,7 @@ plugins:
     far_depth_m: 4.0
     gamma: 0.70
     jpeg_quality: 88
+    auto_contrast: true
   camera_pointcloud:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
