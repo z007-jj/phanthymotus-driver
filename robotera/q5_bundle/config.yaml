@@ -53,6 +53,7 @@ plugins:
     device: "plughw:2,0"
     library_dir: "/opt/phanthy-motus/data/audios"
     upload_max_bytes: 20971520
+    xos_http_base: "http://192.168.8.100:1888"
   camera_rgb:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"

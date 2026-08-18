@@ -10,6 +10,7 @@ import io
 import audioop
 import base64
 import binascii
+import json
 import os
 import re
 import shlex
@@ -17,6 +18,8 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -1029,7 +1032,10 @@ def _wait_for_future(future, timeout_sec: float):
 class AudioPlugin:
     """Vendor audio playback via /audio_player/play and paired services."""
 
-    _upload_directory = "/xos/xos/data/audio/replay_wav"
+    _xos_audio_list_path = "/robot/replay/tts/list?lang=zh"
+    _xos_audio_upload_path = "/robot/replay/tts/upload_audio?lang=zh"
+    _xos_audio_check_path = "/robot/replay/tts/check_audio_exist?lang=zh"
+    _xos_audio_delete_path = "/robot/replay/tts/delete?lang=zh"
 
     def __init__(self, plugin_config, namespace, executor, client):
         del namespace, client
@@ -1043,6 +1049,7 @@ class AudioPlugin:
         self._library_dir = os.path.realpath(str(plugin_config.get(
             "library_dir", "/opt/phanthy-motus/data/audios")))
         self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
+        self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
 
     def get_tool(self):
         play_actions = {
@@ -1053,10 +1060,10 @@ class AudioPlugin:
         }
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
-            "description": "Q5 vendor stored-audio playback, upload-to-path, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
+            "description": "Q5 XOS audio-library playback, upload, listing, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "set_volume", "stop_audio", "is_play", "stop"],
+                    *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "delete_audio", "set_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
                         *[{"const": action, "title": detail["title"]}
                           for action, detail in play_actions.items()],
@@ -1064,6 +1071,7 @@ class AudioPlugin:
                         {"const": "list_robot_audio_files", "title": "查看机器人音频文件"},
                         {"const": "upload_from_library", "title": "从挂载音频库上传"},
                         {"const": "upload_base64", "title": "上传音频到机器人"},
+                        {"const": "delete_audio", "title": "从 XOS 音频库删除"},
                         {"const": "set_volume", "title": "设置音量"},
                         {"const": "stop_audio", "title": "停止播放"},
                         {"const": "is_play", "title": "查询播放状态"},
@@ -1086,11 +1094,13 @@ class AudioPlugin:
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
                     "list_library": {"params": [], "description": "列出 /opt/phanthy-motus/data/audios 中可上传的 WAV/MP3 文件。"},
-                    "list_robot_audio_files": {"params": [], "description": "列出机器人 replay_wav 目录内的文件；播放请使用返回的 file_name 调用 play_by_file_name。"},
+                    "list_robot_audio_files": {"params": [], "description": "列出 XOS 音频库；返回的 audio_name 可作为 file_name 调用 play_by_file_name。"},
                     "upload_from_library": {"params": ["file_name"],
-                                            "description": "从挂载音频库按文件名上传 WAV/MP3；上传后使用同名 file_name 调用 play_by_file_name。"},
+                                            "description": "通过 XOS HTTP 音频库接口上传 WAV/MP3；上传后使用返回的 audio_name 调用 play_by_file_name。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
-                                      "description": "上传 WAV/MP3 到机器人 replay_wav 目录；上传后使用同名 file_name 调用 play_by_file_name。不会创建 XOS 音频库 ID。"},
+                                      "description": "通过 XOS HTTP 音频库接口上传 WAV/MP3；上传后使用 file_name 播放。当前 XOS 列表接口不返回数字 ID。"},
+                    "delete_audio": {"params": ["file_name"],
+                                     "description": "从 XOS 音频库删除指定 audio_name。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
                     "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
                     "is_play": {"params": [], "description": "查询当前是否正在播放。"},
@@ -1119,6 +1129,8 @@ class AudioPlugin:
             return self._upload_from_library(args)
         if action == "upload_base64":
             return self._upload_base64(args)
+        if action == "delete_audio":
+            return self._delete_audio(args)
         if action == "set_volume":
             return self._set_volume(args.get("volume", 50))
         if action == "stop_audio":
@@ -1171,32 +1183,21 @@ class AudioPlugin:
         return self._upload_payload(file_name, payload)
 
     def _list_robot_audio_files(self):
-        # The manual documents this replay directory, but exposes no service
-        # for enumerating the XOS audio-library database or its numeric IDs.
-        command = _q5_root_command(
-            f"if [ -d {shlex.quote(self._upload_directory)} ]; then "
-            f"find {shlex.quote(self._upload_directory)} -maxdepth 1 -type f "
-            "\\( -iname '*.wav' -o -iname '*.mp3' \\) -printf '%f\\t%s\\n' | sort; "
-            "fi"
-        )
-        try:
-            result = _q5_remote_command(command, timeout=15.0)
-        except Exception as exc:
-            return {"state": "error", "message": f"cannot list Q5 audio files: {exc}"}
-        if result.returncode:
-            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
-            return {"state": "error", "message": f"cannot list Q5 audio files: {detail or 'remote command failed'}"}
+        response = self._xos_json_request(self._xos_audio_list_path)
+        if response.get("code") != 200:
+            return {"state": "error", "message": response.get("msg", "XOS audio list failed")}
         files = []
-        for line in result.stdout.decode(errors="replace").splitlines():
-            name, separator, size = line.partition("\t")
-            if self._valid_upload_name(name):
-                files.append({"file_name": name, "path": f"{self._upload_directory}/{name}",
-                              "bytes": int(size) if separator and size.isdigit() else None})
-        return {
-            "state": "ok", "directory": self._upload_directory, "files": files,
-            "play_action": "play_by_file_name", "id_mapping_available": False,
-            "note": "The Q5 manual's supported example uses mode=3 and file_name; it exposes no API to list audio-library IDs.",
-        }
+        for entry in response.get("data") or []:
+            if not isinstance(entry, dict) or not entry.get("audio_name"):
+                continue
+            files.append({"file_name": entry["audio_name"], "audio_name": entry["audio_name"],
+                          "bytes": entry.get("size"), "file_size": entry.get("file_size"),
+                          "duration_ms": entry.get("duration_ms"),
+                          "duration_s": entry.get("duration_s"),
+                          "create_time": entry.get("create_time")})
+        return {"state": "ok", "files": files, "play_action": "play_by_file_name",
+                "id_mapping_available": False,
+                "note": "XOS exposes audio_name but no numeric audio-library ID in this endpoint."}
 
     def _upload_base64(self, args):
         file_name = args.get("file_name")
@@ -1211,41 +1212,68 @@ class AudioPlugin:
             return {"state": "error", "message": "content_base64 is not valid Base64"}
         return self._upload_payload(file_name, payload)
 
+    def _delete_audio(self, args):
+        file_name = args.get("file_name")
+        if not isinstance(file_name, str) or not file_name.strip():
+            return {"state": "error", "message": "file_name is required"}
+        response = self._xos_json_request(
+            self._xos_audio_delete_path, method="POST",
+            payload={"audio_name": file_name})
+        if response.get("code") != 200:
+            return {"state": "error", "message": response.get("msg", "XOS audio delete failed")}
+        return {"state": "ok", "audio_name": file_name, "message": response.get("msg", "success")}
+
     def _upload_payload(self, file_name: str, payload: bytes):
         if not payload:
             return {"state": "error", "message": "audio file is empty"}
         if len(payload) > self._upload_max_bytes:
             return {"state": "error", "message": f"audio file exceeds {self._upload_max_bytes} byte upload limit"}
-        remote_path = f"{self._upload_directory}/{file_name}"
-        temporary_path = f"{remote_path}.part"
-        # Receive the bytes where developer has write access. Then use one
-        # privileged, atomic install/move for the root-owned XOS directory.
-        staging_template = "/tmp/phanthymotus-q5-audio.XXXXXX"
-        sudo_prefix = (
-            f"printf '%s\\n' {shlex.quote(_Q5_DEVELOPER_SUDO_PASSWORD)} | "
-            "sudo -S -p ''"
-        )
-        command = (
-            "set -e; "
-            f"staging=$(mktemp {shlex.quote(staging_template)}); "
-            "trap 'rm -f \"$staging\"' EXIT; "
-            "base64 -d > \"$staging\"; "
-            f"{sudo_prefix} install -D -m 0644 \"$staging\" {shlex.quote(temporary_path)} && "
-            f"{sudo_prefix} mv -f {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
-        )
         try:
-            result = _q5_remote_command(command, timeout=45.0, stdin=base64.b64encode(payload))
-        except Exception as exc:
-            return {"state": "error", "message": f"audio upload failed: {exc}"}
-        if result.returncode:
-            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
-            return {"state": "error", "message": f"audio upload failed: {detail or 'remote command failed'}"}
+            check = self._xos_json_request(
+                self._xos_audio_check_path, method="POST",
+                payload={"audio_name": file_name})
+            if check.get("code") == 200:
+                already_exists = bool((check.get("data") or {}).get("exist"))
+            else:
+                already_exists = None
+            boundary = "----PhanthymotusQ5AudioBoundary"
+            body = (f"--{boundary}\r\n"
+                    f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
+                    "Content-Type: application/octet-stream\r\n\r\n").encode() + payload + \
+                   f"\r\n--{boundary}--\r\n".encode()
+            request = urllib.request.Request(
+                self._xos_http_base + self._xos_audio_upload_path,
+                data=body, method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "X-Requested-With": "XMLHttpRequest"})
+            with urllib.request.urlopen(request, timeout=45.0) as reply:
+                response = json.loads(reply.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            return {"state": "error", "message": f"XOS audio upload failed: {exc}"}
+        if response.get("code") != 200:
+            return {"state": "error", "message": response.get("msg", "XOS audio upload failed")}
         return {
-            "state": "ok", "file_name": file_name, "path": remote_path,
+            "state": "ok", "file_name": file_name, "audio_name": file_name,
             "bytes_uploaded": len(payload), "next_action": "play_by_file_name",
             "play_args": {"file_name": file_name, "force_play": True, "timeout": 0},
-            "note": "File is copied to the XOS replay area. Per the Q5 manual, play it with mode=3 and file_name; this does not create an XOS audio-library id.",
+            "already_exists": already_exists,
+            "note": "Registered through the XOS audio-library API. XOS exposes audio_name, not a numeric ID.",
         }
+
+    def _xos_json_request(self, path, method="GET", payload=None):
+        body = None
+        headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            self._xos_http_base + path,
+            data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as reply:
+                return json.loads(reply.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            return {"code": 0, "msg": f"XOS audio API unavailable: {exc}"}
 
     def _play(self, args, mode: int):
         source_fields = {0: "id", 1: "path", 2: "item", 3: "file_name"}
