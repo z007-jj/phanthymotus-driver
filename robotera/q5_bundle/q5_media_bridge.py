@@ -36,7 +36,10 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
-        self._media_q = self._ctx.Queue(maxsize=4)
+        # Keep independent latest frames for RGB, depth, and pointcloud. The
+        # worker dispatches them by kind; a single tiny queue otherwise lets a
+        # 15 Hz RGB stream overwrite slower depth/pointcloud frames.
+        self._media_q = self._ctx.Queue(maxsize=16)
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
@@ -358,14 +361,16 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         except Exception:
             pass
 
-        newest_media = None
+        newest_media = {}
         while True:
             try:
-                newest_media = media_q.get_nowait()
+                media = media_q.get_nowait()
+                if isinstance(media, dict) and media.get("kind"):
+                    newest_media[media["kind"]] = media
             except Exception:
                 break
-        if newest_media is not None:
-            _dispatch_media(newest_media)
+        for media in newest_media.values():
+            _dispatch_media(media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.
