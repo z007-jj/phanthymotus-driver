@@ -264,11 +264,11 @@ rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 pending = bytearray()
-# Use the original verified live-speaker cadence. The remote DDS/SSH path can
-# pause for over 250 ms; 600 ms blocks and a two-block prefill keep this USB
-# ALSA device fed instead of repeatedly dropping into an inaudible underrun.
-input_block_bytes = 9600
-prefill_bytes = input_block_bytes * 2
+# Keep enough queued PCM for the observed network jitter, but use 100 ms
+# writes rather than the former 600 ms blocks. This lowers live-speech delay
+# by roughly 800 ms while retaining a 400 ms guard against ALSA underruns.
+input_block_bytes = 3200
+prefill_bytes = input_block_bytes * 4
 try:
   while True:
     chunk = sys.stdin.buffer.read(input_block_bytes)
@@ -1214,17 +1214,17 @@ class AudioPlugin:
         # Receive the bytes where developer has write access. Then use one
         # privileged, atomic install/move for the root-owned XOS directory.
         staging_template = "/tmp/phanthymotus-q5-audio.XXXXXX"
-        root_install = (
-            f"install -D -m 0644 {{staging}} {shlex.quote(temporary_path)} && "
-            f"mv -f {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
+        sudo_prefix = (
+            f"printf '%s\\n' {shlex.quote(_Q5_DEVELOPER_SUDO_PASSWORD)} | "
+            "sudo -S -p ''"
         )
         command = (
             "set -e; "
             f"staging=$(mktemp {shlex.quote(staging_template)}); "
-            "export staging; "
             "trap 'rm -f \"$staging\"' EXIT; "
             "base64 -d > \"$staging\"; "
-            + _q5_root_command(root_install.format(staging='"$staging"'))
+            f"{sudo_prefix} install -D -m 0644 \"$staging\" {shlex.quote(temporary_path)} && "
+            f"{sudo_prefix} mv -f {shlex.quote(temporary_path)} {shlex.quote(remote_path)}"
         )
         try:
             result = _q5_remote_command(command, timeout=45.0, stdin=base64.b64encode(payload))
