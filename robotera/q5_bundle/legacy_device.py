@@ -412,7 +412,7 @@ class SpeakerPlugin:
         # Live PCM from remote_mic/TTS is substantially quieter than XOS's
         # stored-audio route. This is a source calibration, while `volume`
         # remains the user-facing 0-100 control.
-        self._input_gain = max(1.0, min(16.0, float(plugin_config.get("input_gain", 12.0))))
+        self._input_gain = max(1.0, min(16.0, float(plugin_config.get("input_gain", 6.0))))
         self._system_volume = None
         self._node = Node("q5_speaker")
         executor.add_node(self._node)
