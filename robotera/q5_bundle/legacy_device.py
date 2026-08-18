@@ -538,9 +538,12 @@ class SpeakerPlugin:
         """Set XOS's global route volume on the robot's Domain-211 stack."""
         command = (
             "source /opt/ros/humble/setup.bash; "
+            "if test -f /q5_ws/install/setup.bash; then source /q5_ws/install/setup.bash; fi; "
             "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
-            f"timeout 3 ros2 service call /audio_player/set_volume "
-            f"xbot_common_interfaces/srv/SetVolume '{{volume: {int(volume)}}}'"
+            "service_type=$(ros2 service type /audio_player/set_volume); "
+            "test -n \"$service_type\"; "
+            f"timeout 3 ros2 service call /audio_player/set_volume \"$service_type\" "
+            f"'{{volume: {int(volume)}}}'"
         )
         try:
             result = _q5_remote_command(command, timeout=5.0)
@@ -1257,6 +1260,12 @@ class AudioPlugin:
                 return False
             candidate = args.get(field)
             if field == "id":
+                # The card form commonly keeps an id control in the payload
+                # even for PATH/ITEM/FILE_NAME actions. It is not part of
+                # those goals and must not make an otherwise valid request
+                # fail validation.
+                if mode != 0:
+                    return False
                 return isinstance(candidate, int) and not isinstance(candidate, bool) and candidate != 0
             return isinstance(candidate, str) and bool(candidate.strip())
 
@@ -1279,10 +1288,13 @@ class AudioPlugin:
         # owns the route. Make an explicit audio-card request preempt that
         # session unless the caller opts out.
         goal.force_play = bool(args.get("force_play", True))
-        goal.id = int(args.get("id", 0))
-        goal.path = str(args.get("path", ""))
-        goal.item = str(args.get("item", ""))
-        goal.file_name = str(args.get("file_name", ""))
+        # Send precisely one source field. Besides making the action contract
+        # unambiguous, this shields XOS from controls retained by a previous
+        # card-mode selection.
+        goal.id = int(value) if mode == 0 else 0
+        goal.path = str(value) if mode == 1 else ""
+        goal.item = str(value) if mode == 2 else ""
+        goal.file_name = str(value) if mode == 3 else ""
         goal.channel = str(args.get("channel", "default"))
         goal.timeout = int(args.get("timeout", 0))
         goal.version = str(args.get("version", "v1"))
