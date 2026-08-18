@@ -48,6 +48,7 @@ plugins:
     volume: 100
     # Compensates for the lower level of live remote_mic/TTS PCM than XOS files.
     input_gain: 6.0
+    xos_http_base: "http://192.168.8.100:1888"
   audio:
     enabled: true
     device: "plughw:2,0"

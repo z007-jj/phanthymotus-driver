@@ -68,6 +68,49 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
 _Q5_MIC_PIDFILE = "/tmp/phanthymotus-q5-mic-capture.pid"
 _Q5_SPEAKER_PIDFILE = "/tmp/phanthymotus-q5-speaker-playback.pid"
 _Q5_DEVELOPER_SUDO_PASSWORD = "developer"
+_Q5_XOS_CHAT_LOCK = threading.RLock()
+
+
+def _q5_xos_json_request(base: str, path: str, method: str = "POST", payload=None):
+    body = None
+    headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base.rstrip("/") + path, data=body,
+                                     method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10.0) as reply:
+            return json.loads(reply.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        return {"code": 0, "msg": f"XOS chat API unavailable: {exc}"}
+
+
+def _q5_xos_chat_is_on(base: str):
+    response = _q5_xos_json_request(base, "/robot/chat/get_chat_launch_state?lang=zh")
+    if response.get("code") != 200:
+        return None, response.get("msg", "XOS chat state unavailable")
+    return str(response.get("data", "")).upper() == "ON", None
+
+
+def _q5_xos_chat_wait(base: str, wanted_on: bool, timeout: float = 8.0):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        state, error = _q5_xos_chat_is_on(base)
+        if error:
+            last_error = error
+        elif state is wanted_on:
+            return True, None
+        time.sleep(0.2)
+    return False, last_error or ("XOS chat did not reach " + ("ON" if wanted_on else "OFF"))
+
+
+def _q5_xos_chat_set(base: str, path: str):
+    response = _q5_xos_json_request(base, path, payload={})
+    if response.get("code") != 200:
+        return False, response.get("msg", "XOS chat request failed")
+    return True, None
 
 
 def _q5_root_command(command: str) -> str:
@@ -413,6 +456,9 @@ class SpeakerPlugin:
         # stored-audio route. This is a source calibration, while `volume`
         # remains the user-facing 0-100 control.
         self._input_gain = max(1.0, min(16.0, float(plugin_config.get("input_gain", 6.0))))
+        self._xos_http_base = str(plugin_config.get(
+            "xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
+        self._chat_poll_timeout = max(1.0, float(plugin_config.get("chat_poll_timeout_s", 8.0)))
         self._system_volume = None
         self._node = Node("q5_speaker")
         executor.add_node(self._node)
@@ -454,15 +500,33 @@ class SpeakerPlugin:
         return
 
     def _start_for_topic(self, requested: str) -> None:
-        if self._running and requested == self._topic:
-            return
-        self.stop()
-        try:
-            self._start_playback(requested)
-            print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
-        except Exception as exc:
+        with _Q5_XOS_CHAT_LOCK:
+            if self._running and requested == self._topic:
+                return
             self.stop()
-            print(f"[SpeakerPlugin] playback unavailable: {exc}", flush=True)
+            try:
+                self._prepare_xos_route()
+                self._start_playback(requested)
+                print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
+            except Exception as exc:
+                self.stop()
+                print(f"[SpeakerPlugin] playback unavailable: {exc}", flush=True)
+
+    def _prepare_xos_route(self):
+        """Release XOS chat's route before taking ownership with live ALSA."""
+        state, error = _q5_xos_chat_is_on(self._xos_http_base)
+        if error:
+            raise RuntimeError(f"cannot query XOS chat state: {error}")
+        if not state:
+            return
+        ok, error = _q5_xos_chat_set(
+            self._xos_http_base, "/robot/chat/quit_chat?lang=zh")
+        if not ok:
+            raise RuntimeError(f"cannot close XOS chat for speaker: {error}")
+        ok, error = _q5_xos_chat_wait(
+            self._xos_http_base, False, self._chat_poll_timeout)
+        if not ok:
+            raise RuntimeError(f"XOS chat did not release speaker route: {error}")
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
@@ -1055,7 +1119,6 @@ class AudioPlugin:
         self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
         # XOS chat owns the vendor audio route. Serialize play/launch/quit so
         # two MCP calls cannot tear down one another's playback session.
-        self._chat_lock = threading.RLock()
         self._chat_poll_timeout = max(1.0, float(plugin_config.get("chat_poll_timeout_s", 8.0)))
 
     def get_tool(self):
@@ -1333,7 +1396,7 @@ class AudioPlugin:
     def _play(self, args, mode: int):
         # XOS refuses vendor playback while its chat session is stopped. Keep
         # the session scoped to this request, unless the user had it enabled.
-        with self._chat_lock:
+        with _Q5_XOS_CHAT_LOCK:
             return self._play_with_chat(args, mode)
 
     def _play_with_chat(self, args, mode: int):
@@ -1369,6 +1432,10 @@ class AudioPlugin:
                 return {"state": "error", "message": "id must be an integer greater than 0"}
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
+        # A live speaker process owns the same ALSA playback endpoint as XOS.
+        # Release only the process created by this driver before handing the
+        # route back to XOS chat; unrelated vendor playback is left untouched.
+        _stop_remote_speaker_playback()
         started_chat, chat_error = self._xos_chat_start_for_playback()
         if started_chat is None:
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
