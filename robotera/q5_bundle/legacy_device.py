@@ -264,32 +264,31 @@ rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 pending = bytearray()
-# Keep enough queued PCM for the observed network jitter, but use 100 ms
-# writes rather than the former 600 ms blocks. This lowers live-speech delay
-# by roughly 800 ms while retaining a 400 ms guard against ALSA underruns.
-input_block_bytes = 3200
-prefill_bytes = input_block_bytes * 4
+# Read the raw pipe so a short DDS frame is forwarded immediately. The
+# previous BufferedReader.read(3200) waited for a full 100 ms block and made
+# speech appear to play only after the utterance ended on bursty sources.
+read_bytes = 3200
+write_bytes = 640  # 20 ms of 16 kHz mono PCM; enough for sample alignment.
 try:
   while True:
-    chunk = sys.stdin.buffer.read(input_block_bytes)
+    chunk = sys.stdin.buffer.raw.read(read_bytes)
     if not chunk: break
     pending.extend(chunk)
-    if len(pending) < prefill_bytes:
-      continue
-    raw = bytes(pending[:input_block_bytes])
-    del pending[:input_block_bytes]
-    mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
-    stereo = audioop.tostereo(mono, 2, 1, 1)
-    frames = len(stereo) // %d
-    offset = 0
-    while offset < frames:
-      portion = stereo[offset * %d:]
-      buf = ctypes.create_string_buffer(portion)
-      written = alsa.snd_pcm_writei(pcm, buf, frames - offset)
-      if written < 0:
-        alsa.snd_pcm_prepare(pcm)
-        continue
-      offset += written
+    while len(pending) >= write_bytes:
+      raw = bytes(pending[:write_bytes])
+      del pending[:write_bytes]
+      mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
+      stereo = audioop.tostereo(mono, 2, 1, 1)
+      frames = len(stereo) // %d
+      offset = 0
+      while offset < frames:
+        portion = stereo[offset * %d:]
+        buf = ctypes.create_string_buffer(portion)
+        written = alsa.snd_pcm_writei(pcm, buf, frames - offset)
+        if written < 0:
+          alsa.snd_pcm_prepare(pcm)
+          continue
+        offset += written
 finally:
   alsa.snd_pcm_drain(pcm)
   alsa.snd_pcm_close(pcm)
@@ -407,7 +406,10 @@ class SpeakerPlugin:
         self._output_rate = int(plugin_config.get("output_sample_rate_hz", 44100))
         self._output_channels = int(plugin_config.get("output_channels", 2))
         self._volume = max(0, min(100, int(plugin_config.get("volume", 100))))
-        self._input_gain = max(1.0, min(4.0, float(plugin_config.get("input_gain", 3.0))))
+        # Live PCM from remote_mic/TTS is substantially quieter than XOS's
+        # stored-audio route. This is a source calibration, while `volume`
+        # remains the user-facing 0-100 control.
+        self._input_gain = max(1.0, min(8.0, float(plugin_config.get("input_gain", 6.0))))
         self._system_volume = None
         self._node = Node("q5_speaker")
         executor.add_node(self._node)
@@ -425,7 +427,7 @@ class SpeakerPlugin:
     def get_tool(self):
         return {
             "name": "speaker", "type": "actuator", "multiInstance": False,
-            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume controls the Q5 system volume and the live PCM stream.",
+            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume controls live PCM gain and requests the Q5 system volume.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "set_volume", "stop", "info"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
@@ -434,7 +436,7 @@ class SpeakerPlugin:
             }, "required": ["action"], "additionalProperties": False},
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
-                "set_volume": {"params": ["volume"], "description": "设置 Q5 系统音量和实时 speaker 音量，0 静音，100 最大。"},
+                "set_volume": {"params": ["volume"], "description": "设置实时 PCM 音量并请求 Q5 系统音量，0 静音，100 最大。"},
                 "stop": {"params": [], "description": "停止实时播放。"},
                 "info": {"params": [], "description": "查看 speaker 状态。"},
             },
@@ -1079,11 +1081,11 @@ class AudioPlugin:
                                   "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
                        for action, detail in play_actions.items()},
                     "list_library": {"params": [], "description": "列出 /opt/phanthy-motus/data/audios 中可上传的 WAV/MP3 文件。"},
-                    "list_robot_audio_files": {"params": [], "description": "列出 Q5 XOS replay_wav 目录内的文件和可供 play_by_path 使用的完整路径；厂商未提供 ID 映射查询。"},
+                    "list_robot_audio_files": {"params": [], "description": "列出机器人 replay_wav 目录内的文件；播放请使用返回的 file_name 调用 play_by_file_name。"},
                     "upload_from_library": {"params": ["file_name"],
-                                            "description": "从挂载音频库按文件名上传 WAV/MP3；返回的 path 可传给 play_by_path。"},
+                                            "description": "从挂载音频库按文件名上传 WAV/MP3；上传后使用同名 file_name 调用 play_by_file_name。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
-                                      "description": "上传 WAV/MP3 到机器人 replay_wav 目录；返回的 path 可传给 play_by_path。不会创建 XOS 音频库 ID。"},
+                                      "description": "上传 WAV/MP3 到机器人 replay_wav 目录；上传后使用同名 file_name 调用 play_by_file_name。不会创建 XOS 音频库 ID。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
                     "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
                     "is_play": {"params": [], "description": "查询当前是否正在播放。"},
@@ -1187,8 +1189,8 @@ class AudioPlugin:
                               "bytes": int(size) if separator and size.isdigit() else None})
         return {
             "state": "ok", "directory": self._upload_directory, "files": files,
-            "play_action": "play_by_path", "id_mapping_available": False,
-            "note": "The Q5 manual exposes no API to list XOS audio-library IDs; use each returned path with play_by_path.",
+            "play_action": "play_by_file_name", "id_mapping_available": False,
+            "note": "The Q5 manual's supported example uses mode=3 and file_name; it exposes no API to list audio-library IDs.",
         }
 
     def _upload_base64(self, args):
@@ -1235,8 +1237,9 @@ class AudioPlugin:
             return {"state": "error", "message": f"audio upload failed: {detail or 'remote command failed'}"}
         return {
             "state": "ok", "file_name": file_name, "path": remote_path,
-            "bytes_uploaded": len(payload), "next_action": "play_by_path",
-            "note": "File is copied to the replay path; this does not create an XOS audio-library id.",
+            "bytes_uploaded": len(payload), "next_action": "play_by_file_name",
+            "play_args": {"file_name": file_name, "force_play": True, "timeout": 0},
+            "note": "File is copied to the XOS replay area. Per the Q5 manual, play it with mode=3 and file_name; this does not create an XOS audio-library id.",
         }
 
     def _play(self, args, mode: int):
