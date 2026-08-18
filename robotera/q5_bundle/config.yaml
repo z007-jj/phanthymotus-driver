@@ -47,7 +47,7 @@ plugins:
     output_channels: 2
     volume: 100
     # Compensates for the lower level of live remote_mic/TTS PCM than XOS files.
-    input_gain: 6.0
+    input_gain: 12.0
   audio:
     enabled: true
     device: "plughw:2,0"

@@ -409,7 +409,7 @@ class SpeakerPlugin:
         # Live PCM from remote_mic/TTS is substantially quieter than XOS's
         # stored-audio route. This is a source calibration, while `volume`
         # remains the user-facing 0-100 control.
-        self._input_gain = max(1.0, min(8.0, float(plugin_config.get("input_gain", 6.0))))
+        self._input_gain = max(1.0, min(16.0, float(plugin_config.get("input_gain", 12.0))))
         self._system_volume = None
         self._node = Node("q5_speaker")
         executor.add_node(self._node)
@@ -535,25 +535,27 @@ class SpeakerPlugin:
                 break
 
     def _set_system_volume(self, volume: int) -> None:
-        """Set XOS's global audio route volume without starting its player."""
-        if not self._srv_volume.wait_for_service(timeout_sec=2.0):
-            self._system_volume = {"state": "unavailable", "volume": volume}
-            print("[SpeakerPlugin] XOS volume service is unavailable", flush=True)
-            return
-        request = SetVolume.Request()
-        request.volume = volume
-        response = _wait_for_future(self._srv_volume.call_async(request), 2.0)
-        if response is None:
-            self._system_volume = {"state": "timeout", "volume": volume}
-            print("[SpeakerPlugin] XOS volume request timed out", flush=True)
-            return
-        self._system_volume = {
-            "state": "ok" if response.success else "error",
-            "volume": volume,
-            "message": response.message,
-        }
-        if not response.success:
-            print(f"[SpeakerPlugin] XOS volume was not set: {response.message}", flush=True)
+        """Set XOS's global route volume on the robot's Domain-211 stack."""
+        command = (
+            "source /opt/ros/humble/setup.bash; "
+            "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+            f"timeout 3 ros2 service call /audio_player/set_volume "
+            f"xbot_common_interfaces/srv/SetVolume '{{volume: {int(volume)}}}'"
+        )
+        try:
+            result = _q5_remote_command(command, timeout=5.0)
+            output = (result.stdout or result.stderr).decode(errors="replace").strip()
+            success = bool(re.search(r"success:\s*true", output, re.IGNORECASE))
+            self._system_volume = {
+                "state": "ok" if success else "error",
+                "volume": volume,
+                "message": output[-500:] if output else "no response",
+            }
+            if not success:
+                print(f"[SpeakerPlugin] XOS volume was not set: {output}", flush=True)
+        except Exception as exc:
+            self._system_volume = {"state": "error", "volume": volume, "message": str(exc)}
+            print(f"[SpeakerPlugin] XOS volume request failed: {exc}", flush=True)
 
     def stop(self):
         self._running = False
@@ -1247,8 +1249,19 @@ class AudioPlugin:
         source_field = source_fields[mode]
         if source_field not in args:
             return {"state": "error", "message": f"mode {mode} requires {source_field}"}
+        # Canvas forms may serialize every optional field with an empty
+        # default (or id=0). Ignore those defaults; reject only a genuinely
+        # populated alternate source field.
+        def _populated(field):
+            if field not in args:
+                return False
+            candidate = args.get(field)
+            if field == "id":
+                return isinstance(candidate, int) and not isinstance(candidate, bool) and candidate != 0
+            return isinstance(candidate, str) and bool(candidate.strip())
+
         unrelated = sorted(field for field in source_fields.values()
-                           if field != source_field and field in args)
+                           if field != source_field and _populated(field))
         if unrelated:
             return {"state": "error", "message": (
                 f"mode {mode} only accepts {source_field}; do not provide {', '.join(unrelated)}")}
@@ -1262,7 +1275,10 @@ class AudioPlugin:
             return {"state": "error", "message": "/audio_player/play is unavailable"}
         goal = AudioPlay.Goal()
         goal.mode = mode
-        goal.force_play = bool(args.get("force_play", False))
+        # XOS reports a successful action even when another playback session
+        # owns the route. Make an explicit audio-card request preempt that
+        # session unless the caller opts out.
+        goal.force_play = bool(args.get("force_play", True))
         goal.id = int(args.get("id", 0))
         goal.path = str(args.get("path", ""))
         goal.item = str(args.get("item", ""))
